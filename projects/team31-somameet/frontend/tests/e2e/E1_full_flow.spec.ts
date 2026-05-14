@@ -103,13 +103,22 @@ async function clickRdpDate(
   const targetMonthLabel = `${targetYear}년 ${KO_MONTHS[target.getMonth()]}`
 
   // Advance calendar up to 18 months (well over any plausible window).
+  // v4 — Calendar wrapper overrides react-day-picker's default `rdp-*` classes
+  // so we read the caption via the live region (role="status") that v9 keeps
+  // for screen readers, plus the grid's aria-label as a fallback.
   for (let i = 0; i < 18; i++) {
-    const caption = await picker
-      .locator(".rdp-caption_label, .rdp-month_caption")
+    const captionFromStatus = await picker
+      .getByRole("status")
       .first()
       .innerText()
       .catch(() => "")
-    if (caption.replace(/\s+/g, " ").includes(targetMonthLabel)) break
+    const captionFromGrid = await picker
+      .getByRole("grid")
+      .first()
+      .getAttribute("aria-label")
+      .catch(() => null)
+    const captionText = `${captionFromStatus} ${captionFromGrid ?? ""}`
+    if (captionText.replace(/\s+/g, " ").includes(targetMonthLabel)) break
 
     const next = picker.getByRole("button", { name: /다음|Next/i }).first()
     await next.click()
@@ -156,7 +165,8 @@ test("E1: full flow from creation through confirm in template-LLM mode", async (
   const organizer = await organizerContext.newPage()
 
   await organizer.goto("/")
-  await expect(organizer.getByRole("heading", { name: "SomaMeet" })).toBeVisible()
+  // v4 redesign: page h1 is "회의 만들기"; "SomaMeet" lives in the TopBar wordmark.
+  await expect(organizer.getByRole("heading", { name: "회의 만들기" })).toBeVisible()
 
   await organizer.locator("#title").fill("팀 회의")
 
@@ -171,19 +181,15 @@ test("E1: full flow from creation through confirm in template-LLM mode", async (
   await clickRdpDate(organizer, "date-range-picker", monday)
   await clickRdpDate(organizer, "date-range-picker", friday)
 
-  // duration: 60min — participant_count input was retired in v3.1.
-  await organizer.locator("#duration_minutes").selectOption("60")
+  // duration: 60min via segmented testid (v4 redesign — native select replaced
+  // by a segmented control for visual consistency with location/period-mode).
+  await organizer.locator('[data-testid="duration-60"]').click()
 
-  // Step 3 — segmented location control. Touch each option, finally settle
-  // on offline so the buffer Select is exercised.
+  // Step 3 — segmented location control. v3 follow-up: 회의 전체 buffer 가
+  // 제거되어 location 변경만 exercise. 개인 buffer 는 회의 페이지에서 따로 처리.
   await organizer.locator('[data-testid="location-online"]').click()
-  // online hides the buffer dropdown
-  await expect(organizer.locator('[data-testid="buffer-select"]')).toHaveCount(0)
   await organizer.locator('[data-testid="location-any"]').click()
-  await expect(organizer.locator('[data-testid="buffer-select"]')).toBeVisible()
   await organizer.locator('[data-testid="location-offline"]').click()
-  await expect(organizer.locator('[data-testid="buffer-select"]')).toBeVisible()
-  await organizer.locator('[data-testid="buffer-select"]').selectOption("60")
 
   // Submit
   await organizer.locator('[data-testid="create-submit"]').click()
@@ -198,17 +204,29 @@ test("E1: full flow from creation through confirm in template-LLM mode", async (
   const slug = slugMatch![1]
   // The share URL is the URL bar itself.
   const shareUrl = currentUrl
-  // Meeting summary loads on the destination page.
+  // Pre-join state: both MeetingSummary (read-only meeting facts) and
+  // JoinSection are rendered together (matches pic_02 mockup).
+  await expect(organizer.locator('[data-testid="meeting-summary"]')).toBeVisible()
+  await expect(organizer.locator('[data-testid="join-form"]')).toBeVisible()
+
+  // Organizer registers themselves as a participant so the full meeting UI
+  // (MeetingSummary + result buttons) is unlocked for the rest of the test.
+  await organizer.locator('[data-testid="join-nickname"]').fill("주최자")
+  await organizer.locator('[data-testid="join-pin"]').fill("9999")
+  await organizer.locator('[data-testid="join-submit"]').click()
   await expect(organizer.locator('[data-testid="meeting-summary"]')).toBeVisible()
 
   // -------- step 5: shared URL in incognito context -> page loads (Path B) --------
   // v3.2 Path B: pick / 확정 buttons are intentionally available everywhere —
   // anyone with the share URL can confirm. The accident safeguard is the
-  // 2-step ShareMessageDialog. Just verify the summary renders here.
+  // 2-step ShareMessageDialog itself. An unjoined visitor sees both the
+  // meeting summary and the join form (no cookie yet -> CurrentParticipantCard
+  // slot renders JoinSection in its place).
   const peekContext = await browser.newContext()
   const peek = await peekContext.newPage()
   await peek.goto(shareUrl)
   await expect(peek.locator('[data-testid="meeting-summary"]')).toBeVisible()
+  await expect(peek.locator('[data-testid="join-form"]')).toBeVisible()
   await peekContext.close()
 
   // -------- step 6 + 7: three participants register (with optional PIN) and submit manual --------
@@ -223,16 +241,17 @@ test("E1: full flow from creation through confirm in template-LLM mode", async (
     const p = await ctx.newPage()
     await p.goto(shareUrl)
 
-    // Step 6 — JoinSection. Optional PIN field is a 4-digit input.
+    // Step 6 — JoinSection. v4 Phase F: PIN is now required (4-digit).
+    // Buffer dropdown removed — JoinSection sends a default (60min for
+    // offline/any meetings) automatically; users adjust via SelfCard chips
+    // after joining.
     await p.locator('[data-testid="join-nickname"]').fill(nickname)
-    if (opts.pin) {
-      await p.locator('[data-testid="join-pin"]').fill(opts.pin)
-    }
+    await p.locator('[data-testid="join-pin"]').fill(opts.pin ?? "1111")
     await p.locator('[data-testid="join-submit"]').click()
 
-    // Step 7 — AvailabilitySection appears with tabs.
-    await expect(p.getByRole("tab", { name: "직접 입력" })).toBeVisible({ timeout: 10_000 })
-    await p.getByRole("tab", { name: "직접 입력" }).click()
+    // Step 7 — AvailabilitySection appears with segmented tabs (Soma AvailInput pattern).
+    await expect(p.locator('[data-testid="availability-tab-manual"]')).toBeVisible({ timeout: 10_000 })
+    await p.locator('[data-testid="availability-tab-manual"]').click()
 
     // Mode toggle defaults to timeline; switch to chip grid for deterministic flow.
     await p.locator('[data-testid="mode-toggle-grid"]').click()
@@ -271,8 +290,7 @@ test("E1: full flow from creation through confirm in template-LLM mode", async (
   // is "0명 제출 완료" (no submissions yet), NOT "1/3 disabled" as in v3.
   await organizer.reload()
   await expect(organizer.locator('[data-testid="meeting-summary"]')).toBeVisible()
-  await expect(organizer.locator('[data-testid="progress-text"]')).toContainText("0")
-  await expect(organizer.locator('[data-testid="progress-text"]')).toContainText("제출 완료")
+  await expect(organizer.locator('[data-testid="participants-card"]')).toContainText("0명 제출")
   await expect(organizer.locator('[data-testid="calculate-button"]')).toBeDisabled()
   await expect(organizer.locator('[data-testid="recommend-button"]')).toBeDisabled()
 
@@ -291,7 +309,7 @@ test("E1: full flow from creation through confirm in template-LLM mode", async (
 
   await organizer.reload()
   await expect(organizer.locator('[data-testid="meeting-summary"]')).toBeVisible()
-  await expect(organizer.locator('[data-testid="progress-text"]')).toContainText("3")
+  await expect(organizer.locator('[data-testid="participants-card"]')).toContainText("3명 제출")
   await expect(organizer.locator('[data-testid="calculate-button"]')).toBeEnabled({
     timeout: 5_000,
   })
@@ -328,7 +346,7 @@ test("E1: full flow from creation through confirm in template-LLM mode", async (
   const dialogTitle = organizer.locator("#share-message-title")
   await expect(dialogTitle).toBeVisible({ timeout: 15_000 })
   // Pre-confirm dialog title — see ShareMessageDialog (readOnly=false).
-  await expect(dialogTitle).toHaveText("메시지 확인 후 확정")
+  await expect(dialogTitle).toHaveText("메시지 확인 후 확정해 주세요")
 
   const textarea = organizer.locator('[data-testid="share-draft-textarea"]')
   await expect(textarea).toBeVisible()
@@ -340,7 +358,7 @@ test("E1: full flow from creation through confirm in template-LLM mode", async (
   expect(message).not.toMatch(/병원|진료|데이트/)
 
   // Copy button -> clipboard stub captures the message.
-  await organizer.getByRole("button", { name: "메시지 복사" }).click()
+  await organizer.getByRole("dialog").getByRole("button", { name: "공지 복사" }).click()
   await expect(organizer.locator("text=메시지가 복사되었습니다.")).toBeVisible({
     timeout: 5_000,
   })
@@ -357,8 +375,10 @@ test("E1: full flow from creation through confirm in template-LLM mode", async (
   // text to flip from pre-confirm to post-confirm.
   await expect(dialogTitle).toHaveText("확정 안내 메시지", { timeout: 15_000 })
 
-  // Close dialog.
-  await organizer.getByRole("button", { name: "닫기" }).click()
+  // Close dialog. v4 Phase E — redesigned modals add an icon-only X button
+  // with aria-label="<context> 창 닫기" alongside the footer "닫기" text
+  // button, so we need exact-match to avoid strict-mode collisions.
+  await organizer.getByRole("button", { name: "닫기", exact: true }).click()
 
   // -------- step 13: timetable horizontal layout — date row, time column --------
   // Timetable component renders with data-testid="timetable-horizontal".
@@ -383,7 +403,9 @@ test("E1: full flow from creation through confirm in template-LLM mode", async (
   await timetable.screenshot({ path: "test-results/timetable-merged.png" })
 
   // Bookkeeping: slug visible on header for debug clarity.
-  await expect(organizer.getByText(`slug: ${slug}`)).toBeVisible()
+  await expect(
+    organizer.getByTestId("meeting-summary").getByText(`slug: ${slug}`),
+  ).toBeVisible()
 
   await organizerContext.close()
 })

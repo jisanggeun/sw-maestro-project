@@ -13,7 +13,7 @@ Spec sections 4 / 7 / 7.1 are the source of truth for:
 
 v3 changes:
 - enumerate_search_dates(meeting) honors meeting.date_mode.
-- generate_candidate_windows(...) uses meeting.offline_buffer_minutes.
+- generate_candidate_windows(...) uses per-participant buffer_minutes.
 - "any" now applies the same buffer as "offline" (Q8 — v2->v3 reversal).
 - deterministic_top_candidates(...) is the unified ranker for /calculate
   AND /recommend's fallback path.
@@ -22,6 +22,7 @@ v3 changes:
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -30,7 +31,21 @@ from app.db.models import BusyBlock, Meeting, Participant
 from app.schemas.candidate import Candidate
 
 SLOT_MINUTES = 30
-BUFFER_MINUTES = 30  # legacy default, kept for backward-compat tests
+# Default offline buffer applied when a participant hasn't set a personal
+# buffer of their own. Used to live on Meeting.offline_buffer_minutes — that
+# column was dropped (issue #13 follow-up: per-participant buffer only).
+DEFAULT_BUFFER_MINUTES = 60
+# Legacy alias retained for any external import paths; new code should use
+# DEFAULT_BUFFER_MINUTES.
+BUFFER_MINUTES = DEFAULT_BUFFER_MINUTES
+
+# Issue #57 — every meeting now shares one fixed search window.
+# MEETING_WINDOW_END is the *last slot start*: the last 30-min slot runs
+# 23:30-24:00. _enumerate_slots_v3 compares ``slot_start + duration <=
+# window_end_inclusive``, so we anchor window_end_inclusive at the next
+# day's 00:00.
+MEETING_WINDOW_START = time(6, 0)
+MEETING_WINDOW_END = time(23, 30)
 SPREAD_MIN_MINUTES = 120  # "2h+ apart" rule
 DEFAULT_MAX_WINDOWS = 40
 
@@ -116,7 +131,7 @@ def generate_candidate_windows(
     """Deterministic candidate windows for a meeting.
 
     Iterates the 30-min grid across enumerate_search_dates, applies
-    meeting.offline_buffer_minutes for offline AND any locations
+    per-participant buffer_minutes for offline AND any locations
     (online == buffer 0), and returns up to max_windows windows ordered
     by ranking (available_count desc, then earliest start).
 
@@ -137,7 +152,9 @@ def generate_candidate_windows(
         available, missing = _check_slot(
             slot=slot,
             busy_blocks_by_participant=busy_blocks_by_participant,
-            buffer_minutes=_effective_buffer_minutes(meeting),
+            buffer_minutes_by_pid=_build_buffer_by_pid(
+                meeting, participants, participant_ids
+            ),
             participant_ids=participant_ids,
         )
         if not available:
@@ -208,6 +225,32 @@ def deterministic_top_candidates(
     return [_window_to_candidate(w) for w in chosen]
 
 
+_WEEKDAY_KO_FULL = ["월", "화", "수", "목", "금", "토", "일"]
+_WEEKDAY_TOKEN_RE = re.compile(r"(\d{1,2})/(\d{1,2})\s*\(([월화수목금토일])\)")
+
+
+def _correct_share_weekdays(share: str, start_dt, end_dt) -> str:
+    """LLMs occasionally hallucinate the weekday letter inside the
+    share-message draft (e.g. '5/16 (화)' when 5/16 is actually a Saturday).
+    Replace every 'M/D (X)' token whose (M, D) matches the candidate's
+    start or end date with the deterministic correct weekday.
+    """
+    correct = {
+        (start_dt.month, start_dt.day): _WEEKDAY_KO_FULL[start_dt.weekday()],
+        (end_dt.month, end_dt.day): _WEEKDAY_KO_FULL[end_dt.weekday()],
+    }
+
+    def _sub(match: "re.Match[str]") -> str:
+        m = int(match.group(1))
+        d = int(match.group(2))
+        expected = correct.get((m, d))
+        if expected is None:
+            return match.group(0)
+        return f"{m}/{d} ({expected})"
+
+    return _WEEKDAY_TOKEN_RE.sub(_sub, share)
+
+
 def validate_and_enrich(
     llm_candidates: Sequence[dict],
     windows: Sequence[CandidateWindow],
@@ -266,7 +309,9 @@ def validate_and_enrich(
                 available_count=window.available_count,
                 missing_participants=list(window.missing_participants),
                 reason=reason.strip(),
-                share_message_draft=share.strip(),
+                share_message_draft=_correct_share_weekdays(
+                    share.strip(), window.start, window.end
+                ),
                 note=None,
             )
         )
@@ -306,7 +351,9 @@ def calculate_candidates(
         available, missing = _check_slot(
             slot=slot,
             busy_blocks_by_participant=busy_blocks_by_participant,
-            buffer_minutes=_effective_buffer_minutes(meeting),
+            buffer_minutes_by_pid=_build_buffer_by_pid(
+                meeting, participants, participant_ids
+            ),
             participant_ids=participant_ids,
         )
         avail_count = len(available)
@@ -354,12 +401,43 @@ def calculate_candidates(
 # ============================================================================
 
 
-def _effective_buffer_minutes(meeting: Meeting) -> int:
-    """v3: offline AND any apply buffer; online == 0 (Q8)."""
+def _effective_buffer_minutes(
+    meeting: Meeting, participant: Optional[Participant] = None
+) -> int:
+    """Per-participant effective buffer (issue #13, follow-up).
+
+    The meeting-level ``offline_buffer_minutes`` column has been removed.
+    Rules (in order):
+      * online meeting → 0, regardless of personal override.
+      * participant.buffer_minutes IS NOT NULL → that value (personal override).
+      * otherwise → DEFAULT_BUFFER_MINUTES (60).
+    """
     if meeting.location_type == "online":
         return 0
-    # offline / any
-    return int(getattr(meeting, "offline_buffer_minutes", None) or BUFFER_MINUTES)
+    if participant is not None and participant.buffer_minutes is not None:
+        return int(participant.buffer_minutes)
+    return DEFAULT_BUFFER_MINUTES
+
+
+def _build_buffer_by_pid(
+    meeting: Meeting,
+    participants: Optional[Sequence[Participant]],
+    participant_ids: Sequence[int],
+) -> Dict[int, int]:
+    """Map pid → effective buffer minutes for this meeting+participant.
+
+    Falls back to the meeting-level default for any pid that doesn't appear
+    in ``participants`` (e.g. tests that drive the scheduler with pids alone).
+    """
+    out: Dict[int, int] = {}
+    by_id: Dict[int, Participant] = (
+        {p.id: p for p in participants} if participants else {}
+    )
+    default_buffer = _effective_buffer_minutes(meeting)
+    for pid in participant_ids:
+        p = by_id.get(pid)
+        out[pid] = _effective_buffer_minutes(meeting, p) if p is not None else default_buffer
+    return out
 
 
 def _nickname_map(
@@ -377,8 +455,10 @@ def _enumerate_slots_v3(meeting: Meeting) -> List[Slot]:
 
     slots: List[Slot] = []
     for current_day in enumerate_search_dates(meeting):
-        window_start = datetime.combine(current_day, _floor_time(meeting.time_window_start))
-        window_end = datetime.combine(current_day, meeting.time_window_end)
+        # Issue #57 — fixed window 06:00-24:00. window_end is the next day's
+        # 00:00 so the last 23:30 slot (running 23:30-24:00) stays in the grid.
+        window_start = datetime.combine(current_day, MEETING_WINDOW_START)
+        window_end = datetime.combine(current_day, time(0, 0)) + timedelta(days=1)
         slot_start = window_start
         while slot_start + duration <= window_end:
             slots.append(Slot(start=slot_start, end=slot_start + duration))
@@ -406,19 +486,25 @@ def _check_slot(
     *,
     slot: Slot,
     busy_blocks_by_participant: Dict[int, List[BusyBlock]],
-    buffer_minutes: int,
+    buffer_minutes_by_pid: Dict[int, int],
     participant_ids: Sequence[int],
 ) -> Tuple[Set[int], Set[int]]:
-    if buffer_minutes:
-        check_start = slot.start - timedelta(minutes=buffer_minutes)
-        check_end = slot.end + timedelta(minutes=buffer_minutes)
-    else:
-        check_start = slot.start
-        check_end = slot.end
+    """Per-participant gating (issue #13).
 
+    Each pid is checked against ``[slot.start - their_buffer, slot.end +
+    their_buffer]``, so participants with a larger personal buffer may be
+    excluded from a window where shorter-buffer peers are fine.
+    """
     available: Set[int] = set()
     missing: Set[int] = set()
     for pid in participant_ids:
+        buf = buffer_minutes_by_pid.get(pid, 0)
+        if buf:
+            check_start = slot.start - timedelta(minutes=buf)
+            check_end = slot.end + timedelta(minutes=buf)
+        else:
+            check_start = slot.start
+            check_end = slot.end
         blocks = busy_blocks_by_participant.get(pid, [])
         if _is_participant_free(blocks, check_start, check_end):
             available.add(pid)
@@ -542,8 +628,9 @@ def build_timetable(
 
     out: List[dict] = []
     for current_day in enumerate_search_dates(meeting):
-        window_start = datetime.combine(current_day, _floor_time(meeting.time_window_start))
-        window_end = datetime.combine(current_day, meeting.time_window_end)
+        # Issue #57 — fixed window 06:00-24:00 (next-day 00:00 as exclusive end).
+        window_start = datetime.combine(current_day, MEETING_WINDOW_START)
+        window_end = datetime.combine(current_day, time(0, 0)) + timedelta(days=1)
         slot_start = window_start
         while slot_start + step <= window_end:
             slot_end = slot_start + step

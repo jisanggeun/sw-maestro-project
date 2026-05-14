@@ -14,6 +14,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _PIN_PATTERN = re.compile(r"^\d{4}$")
 
+# Issue #13 — personal travel-time buffer override. Mirrors the meeting-level
+# allowed set so the FE only needs one option list. ``None`` is also valid
+# at the schema level (meaning "inherit the meeting's value") — modelled
+# via Optional + a single sentinel, not via this set.
+_ALLOWED_PARTICIPANT_BUFFER_MINUTES = {0, 30, 60, 90, 120}
+
 
 def _validate_pin(value: Optional[str]) -> Optional[str]:
     if value is None or value == "":
@@ -31,11 +37,18 @@ class ParticipantCreate(BaseModel):
     register → edit → toggle). When omitted, defaults to False for the new
     participant; for the pre-submit re-register path the field is updated
     only when explicitly provided (None → leave existing value alone).
+
+    buffer-on-join: ``buffer_minutes`` is required at registration time —
+    the FE join screen always collects it. Allowed values are
+    0/30/60/90/120; null is not allowed here. PATCH /me later may still
+    set the value to null (inherit/fallback), but a brand-new row always
+    starts with an explicit choice.
     """
 
     nickname: str = Field(min_length=1, max_length=50)
     pin: Optional[str] = Field(default=None, max_length=8)
     is_required: Optional[bool] = Field(default=None)
+    buffer_minutes: int
 
     @field_validator("pin", mode="before")
     @classmethod
@@ -50,6 +63,15 @@ class ParticipantCreate(BaseModel):
     @classmethod
     def _check_pin(cls, v: Optional[str]) -> Optional[str]:
         return _validate_pin(v)
+
+    @field_validator("buffer_minutes")
+    @classmethod
+    def _check_buffer(cls, v: int) -> int:
+        if v not in _ALLOWED_PARTICIPANT_BUFFER_MINUTES:
+            raise ValueError(
+                "buffer_minutes must be one of 0/30/60/90/120"
+            )
+        return v
 
 
 class ParticipantLogin(BaseModel):
@@ -90,6 +112,11 @@ class ParticipantNicknameUpdate(BaseModel):
     nickname: str = Field(min_length=1, max_length=50)
     pin: Optional[str] = Field(default=None, max_length=8)
     is_required: Optional[bool] = Field(default=None)
+    # Issue #13 — personal travel buffer override.
+    #   field absent  → leave existing buffer_minutes unchanged.
+    #   None / null   → reset to "inherit the meeting default".
+    #   0/30/60/90/120 → store the explicit value.
+    buffer_minutes: Optional[int] = Field(default=None)
 
     @field_validator("pin", mode="before")
     @classmethod
@@ -109,6 +136,17 @@ class ParticipantNicknameUpdate(BaseModel):
             raise ValueError("pin must be exactly 4 digits (0-9)")
         return v
 
+    @field_validator("buffer_minutes")
+    @classmethod
+    def _check_buffer(cls, v: Optional[int]) -> Optional[int]:
+        if v is None:
+            return None
+        if v not in _ALLOWED_PARTICIPANT_BUFFER_MINUTES:
+            raise ValueError(
+                "buffer_minutes must be one of 0/30/60/90/120 (or null to inherit)"
+            )
+        return v
+
 
 class ParticipantResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -117,3 +155,5 @@ class ParticipantResponse(BaseModel):
     nickname: str
     source_type: Optional[str] = None
     confirmed_at: Optional[datetime] = None
+    # Issue #13 — None means "inherit the meeting's offline_buffer_minutes".
+    buffer_minutes: Optional[int] = None

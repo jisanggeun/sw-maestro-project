@@ -13,15 +13,22 @@ import {
 } from "@/lib/availabilityCells"
 import { cn } from "@/lib/cn"
 
+export type PendingApplyMode = "overwrite" | "merge"
+
 interface Props {
   slug: string
   meeting: MeetingDetail
   onSubmitted: () => void
-  // v3.24 — ICS upload pre-fill pipeline. AvailabilitySection passes parsed
-  // busy_blocks here when the user uploads an ICS file; the form converts
-  // them to selected cells and clears the pending state via onPendingIcsApplied.
-  pendingIcsBlocks?: { start: string; end: string }[] | null
-  onPendingIcsApplied?: () => void
+  // Pre-fill pipeline shared by ICS upload and natural-language input.
+  // AvailabilitySection passes parsed busy_blocks here; the form converts
+  // them to selected cells based on applyMode, then clears the pending
+  // state via onPendingApplied.
+  //   - "overwrite": replaces current selection (legacy ICS behaviour)
+  //   - "merge": union of available cells with current selected
+  //              (= a slot is available if EITHER input marks it available)
+  pendingBlocks?: { start: string; end: string }[] | null
+  pendingApplyMode?: PendingApplyMode
+  onPendingApplied?: () => void
 }
 
 type InputMode = "timeline" | "grid"
@@ -29,6 +36,7 @@ type InputMode = "timeline" | "grid"
 const MODE_STORAGE_KEY = "somameet_manual_mode"
 const DEFAULT_MODE: InputMode = "timeline"
 
+// #30 — 사용자 선택값 우선, 없으면 pointer-coarse(모바일/터치) 면 grid, 그 외 timeline.
 function readInitialMode(): InputMode {
   if (typeof window === "undefined") return DEFAULT_MODE
   try {
@@ -37,6 +45,11 @@ function readInitialMode(): InputMode {
   } catch {
     // Storage access can throw in private mode; fall through to default.
   }
+  try {
+    if (window.matchMedia?.("(pointer: coarse)").matches) return "grid"
+  } catch {
+    // matchMedia 미지원 환경 fallback.
+  }
   return DEFAULT_MODE
 }
 
@@ -44,8 +57,9 @@ export function ManualAvailabilityForm({
   slug,
   meeting,
   onSubmitted,
-  pendingIcsBlocks,
-  onPendingIcsApplied,
+  pendingBlocks,
+  pendingApplyMode = "overwrite",
+  onPendingApplied,
 }: Props) {
   const { toast } = useToast()
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -83,15 +97,29 @@ export function ManualAvailabilityForm({
     lastAppliedKeyRef.current = myBlocksKey
   }, [myBlocksKey, meeting])
 
-  // v3.24 — when ICS upload hands us parsed busy_blocks, immediately convert
-  // them to a selected Set (= available = allCells - busyCells) so the user
-  // can review on the grid. Then clear the pending so a single tab-switch
-  // doesn't re-apply repeatedly.
+  // When ICS upload / natural-language input hands us parsed busy_blocks,
+  // convert them to a selected Set (= available = allCells - busyCells) and
+  // apply per applyMode:
+  //   - "overwrite": replaces current selection.
+  //   - "merge": union of available cells, so a slot is available when EITHER
+  //              the existing selection or the incoming input marks it available.
+  // Then clear the pending so a single tab-switch doesn't re-apply repeatedly.
   useEffect(() => {
-    if (!pendingIcsBlocks) return
-    setSelected(selectedFromBusyBlocks(meeting, pendingIcsBlocks))
-    onPendingIcsApplied?.()
-  }, [pendingIcsBlocks, meeting, onPendingIcsApplied])
+    if (!pendingBlocks) return
+    const incoming = selectedFromBusyBlocks(meeting, pendingBlocks)
+    if (pendingApplyMode === "merge") {
+      setSelected((prev) => {
+        const next = new Set<string>(prev)
+        for (const k of incoming) {
+          next.add(k)
+        }
+        return next
+      })
+    } else {
+      setSelected(incoming)
+    }
+    onPendingApplied?.()
+  }, [pendingBlocks, pendingApplyMode, meeting, onPendingApplied])
 
   function selectAll() {
     setSelected(new Set(allCells))
@@ -136,9 +164,6 @@ export function ManualAvailabilityForm({
       onSubmit={handleSubmit}
     >
       <div className="flex flex-col gap-2">
-        <p className="text-sm text-muted-foreground">
-          가능한 시간을 선택하세요. 선택하지 않은 시간은 모두 불가능으로 처리됩니다.
-        </p>
         <div
           role="group"
           aria-label="입력 방식"
@@ -161,11 +186,27 @@ export function ManualAvailabilityForm({
         </div>
       </div>
 
-      {mode === "timeline" ? (
-        <AvailabilityTimeline meeting={meeting} value={selected} onChange={setSelected} />
-      ) : (
-        <AvailabilityGrid meeting={meeting} value={selected} onChange={setSelected} />
-      )}
+      {(() => {
+        const bufferMinutes =
+          meeting.location_type === "online"
+            ? 0
+            : meeting.my_buffer_minutes ?? 60
+        return mode === "timeline" ? (
+          <AvailabilityTimeline
+            meeting={meeting}
+            value={selected}
+            onChange={setSelected}
+            bufferMinutes={bufferMinutes}
+          />
+        ) : (
+          <AvailabilityGrid
+            meeting={meeting}
+            value={selected}
+            onChange={setSelected}
+            bufferMinutes={bufferMinutes}
+          />
+        )
+      })()}
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <span className="text-xs text-muted-foreground">

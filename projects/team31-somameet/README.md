@@ -29,12 +29,13 @@
 
 ## 핵심 흐름 (MVP)
 
-1. 회의 생성 (제목, 날짜 범위 또는 후보 날짜, 길이, 위치, 시간대)
+1. 회의 생성 (제목 (선택), 날짜 범위 또는 후보 날짜, 길이, 진행 방식 (online/offline/any))
 2. 공유 URL + QR 코드를 참여자에게 배포
 3. 참여자 등록: **닉네임 + 4자리 PIN(선택) + 필수 참여자 토글(선택)**
-4. 가용 시간 입력
-   - 직접 입력: 30분 단위 캘린더형 그리드
-   - ICS 파일: 파싱 후 그리드에 pre-fill → 사용자가 검토/수정 → 저장
+4. 가용 시간 입력 — 세 입력 방식 모두 동일한 30분 그리드로 수렴
+   - **직접 입력**: 30분 단위 캘린더형 드래그-페인트 그리드
+   - **ICS 파일**: 파싱 후 그리드에 pre-fill → 사용자가 검토/수정 → 저장
+   - **자연어 입력** (Phase D, v3.28): "월요일 9-12 수업 있음" 같은 한국어 문장 → LLM이 busy 블록으로 변환 + 인식한 표현 chip → 합치기/덮어쓰기 → 그리드 검토/수정 → 저장
 5. 1명 이상 제출되면 결과 가능
    - **결과 보기** (`/calculate`) — 결정론적(deterministic) 후보, LLM 호출 없음
    - **추천받기** (`/recommend`) — Upstage solar-pro3 LLM이 후보별 이유 + 공유 메시지 초안 생성
@@ -61,7 +62,7 @@
 
 ### 알고리즘
 - 슬롯 단위 30분, KST(Asia/Seoul) 고정
-- 오프라인 버퍼 0/30/60/90/120분, online은 0, **any는 offline과 동일** (Q8 — 안전 우선)
+- **이동 버퍼는 per-participant** (Issue #13, v3.27 cleanup): `Participant.buffer_minutes` 0/30/60/90/120분. NULL이면 0 분 default. `Meeting.offline_buffer_minutes` 컬럼은 #h7890 migration에서 drop, online/any 회의에서도 본인이 직접 버퍼를 정함
 - 회의 길이 30/60/90/120/150/180분
 - 후보 간 시작 시각 **최소 120분 간격** 강제 (v3.27, deterministic·LLM 양쪽 모두 enforce)
 - 3-tier 추천 우선순위:
@@ -76,7 +77,9 @@
 - `/recommend` = LLM 1회 호출 + 검증 실패 시 최대 3회 재시도 = **최대 4회**
 - 4회 실패 시 deterministic fallback (응답 `source: "deterministic_fallback"`)
 - 네트워크 오류는 즉시 fallback (재시도 없음)
-- LLM 입력에 **이벤트 제목/장소/설명 절대 미포함** — `tests/acceptance/test_acceptance_S1_S11.py` S11에서 prompt spy로 강제
+- `/availability/natural-language/parse` (Phase D, v3.28) = LLM 1회 호출로 자연어 가용 텍스트 → `busy_blocks` + `summary` + chip용 `recognized_phrases`. **preview-only** (DB 저장 없음). 응답이 JSON 파싱 실패하면 500 `llm_parse_failed`, 네트워크 오류는 503 `llm_unavailable`
+- **자연어 파서 agentic Validator-Retry workflow** (PR #98~#100): 1차 LLM 응답을 3-layer validator로 점검 후 위반 시 자가-교정. (1) weekday-scope: 사용자가 언급하지 않은 요일을 LLM이 채우는 환각 차단, (2) chip-intent: "토 가능 / 월 불가" 같은 의미 flip을 chip vs busy_blocks 일관성으로 검증, (3) text-intent fallback: chip이 비어있어도 사용자 raw text의 요일-가능/불가 단서를 직접 매칭. 모두 위반 시 prompt augment 후 최대 1회 retry, 그래도 실패하면 deterministic repair (위반 요일 strip + share_message_draft post-process)
+- LLM 입력에 **이벤트 제목/장소/설명 절대 미포함** — `tests/acceptance/test_acceptance_S1_S11.py` S11에서 prompt spy로 강제. 자연어 파싱 어댑터도 동일 privacy invariant (`build_availability_parse_payload`에 busy_blocks·참여자 ID 미포함, unit test에서 키 잠금)
 - system prompt는 한국 직장인 생활 리듬 가이드 포함 (오전 10~12시·오후 2~5시 선호, 점심·퇴근·러시아워 회피)
 - frontend 5분 client-side 추천 쿨타임 (localStorage)
 
@@ -85,9 +88,10 @@
 - 회의 페이지 좌우 2열 레이아웃 (날짜 ≤ 5일일 때) + 그 외 1열 스택
 - 캘린더형(세로) 타임테이블 (rows=시간, cols=날짜) + `grid-row span`으로 같은 카운트 run 단일 div 렌더
 - 5초 polling으로 다른 참여자 제출 즉시 반영 (탭 백그라운드 스킵, mid-edit 보호)
-- 회의 설정 수정 가능 (`PATCH /api/meetings/{slug}/settings`, 확정 전까지)
-- ICS는 parse-only 후 manual 그리드에 pre-fill → 사용자 검토/수정 → 저장 (commit 전 한 번 더 확인)
+- 회의 설정 수정/삭제 가능 (`PATCH /api/meetings/{slug}/settings`, `DELETE /api/meetings/{slug}`). 확정 전까지만 설정 수정 허용, 삭제는 EditMeetingDialog Danger zone 의 2-step 다이얼로그가 안전망
+- ICS / 자연어 입력 모두 **parse-only → manual 그리드 pre-fill → 사용자 검토/수정 → 저장** 흐름 (commit 전 한 번 더 확인)
 - "주말 포함" 체크박스 UI 제거 (v3.21, 항상 true) — 컬럼은 dead code로 잔존
+- Soma 디자인 적용 (v3.27~v3.28): Pretendard Variable 폰트, 인디고 #4F5AAA primary, 5단계 heat ramp (`--soma-heat-0..5`), 45° hatching gradient buffer, 카드 기반 정보 위계
 
 ---
 
@@ -117,9 +121,28 @@
 | 스타일 | TailwindCSS v3, shadcn/ui 패턴, Radix UI (label/popover/progress/separator/slot/tabs) |
 | 폼 | react-hook-form + zod, `@hookform/resolvers` |
 | 컴포넌트 보조 | class-variance-authority, clsx, tailwind-merge |
-| 폰트/아이콘 | Pretendard, lucide-react |
+| 폰트/아이콘 | Pretendard Variable, lucide-react |
 | 날짜/QR | react-day-picker (단일/범위/다중), qrcode.react, date-fns |
-| 테스트 | Playwright |
+| 테스트 | Playwright (E1 골든패스) |
+
+#### 디자인 시스템 — Soma 팔레트
+
+- **Primary**: `#4F5AAA` (Soma 인디고). hover `#404996`, active `#353D7E`, soft `#EEF0FA`.
+- **Heat ramp** (Timetable 가용 셀): `--soma-heat-0..5`, 5단계 인디고 그라데이션.
+- **Buffer hatching**: `--soma-buffer-bg` (45° 사선) — 추천 후보 양 끝 buffer 영역.
+- 모든 토큰은 `src/index.css` 의 `:root` CSS 변수 + Tailwind config 로 노출.
+
+#### 주요 화면 컴포넌트
+
+- **CreateMeetingPage** — 회의 만들기. 제목 / 진행 시간 / 진행 방식 / 날짜 (range + picked) Segmented + react-day-picker.
+- **JoinSection** — 참여자 등록 (이름 + 4자리 PIN + iOS-style 필수 참여자 토글). 미등록 시 풀 페이지 게이팅.
+- **MeetingSummary** — 회의 메타 (날짜/시간/장소), InviteShareRow (QR + URL), 자동 삭제 chip, 제출 현황 progressbar.
+- **AvailabilitySection** — 직접 입력 / ICS 업로드 / 자연어 입력 3-탭. 자연어는 5상태 (Empty / Typing / Loading / Preview / Error) shell + ExampleChips + fake 3-stage progress.
+- **Timetable** — 캘린더형 가로 그리드 + grid-row span 셀 병합 (v3.17). 5단계 heat ramp, mine indicator (본인 가용 셀 흰 점), best outline (LLM 추천 후보), buffer hatching.
+- **RecommendCard** — sticky 사이드바 통합 카드. 3 상태 (empty / recommended / confirmed). LLM 후보 main pick + alts row + 공유 메시지 초안 + 확정 흐름.
+- **CurrentParticipantCard** — read-mode 카드 + 인라인 BufferChips (0/30/60/90/120) → 즉시 PATCH. 이름/PIN/필수 = SelfEditModal.
+- **EditMeetingDialog** — 방 설정 수정 + Danger zone (회의 삭제, 2-step 확인).
+- **ShareMessageDialog** — 확정 직전/후 공지 메시지 box + 복사/확정 (2-step 게이트).
 
 ### 배포
 
@@ -135,18 +158,18 @@
 team31-somameet/
 ├── backend/
 │   ├── app/
-│   │   ├── api/              # meetings, participants, auth, availability, recommend, timetable
+│   │   ├── api/              # meetings (CRUD + calculate/confirm + DELETE), participants, auth, availability (manual/ICS/NL parse), recommend, timetable
 │   │   ├── core/             # config, dependencies, errors
 │   │   ├── db/               # SQLAlchemy 2.x 모델, 세션, base
-│   │   ├── schemas/          # Pydantic v2 입출력 스키마
-│   │   ├── services/         # scheduler, ics_parser, availability, tokens, timezones
-│   │   │   └── llm/          # base, prompts, upstage, template
+│   │   ├── schemas/          # Pydantic v2 입출력 스키마 (meeting, participant, manual, natural_language, recommendation, …)
+│   │   ├── services/         # scheduler, ics_parser, availability, expiry, tokens, timezones
+│   │   │   └── llm/          # base (parse_availability + recommend abstract), prompts, upstage, template
 │   │   └── main.py           # FastAPI 앱 팩토리 (load_dotenv, CORS regex, 라우터 등록)
 │   ├── alembic/
-│   │   └── versions/         # 03f766...initial → b1c2..v3 → c2d3..drop_target → d3e4..drop_organizer → e4f5..is_required
+│   │   └── versions/         # 03f766…initial → b1c2..v3 → c2d3..drop_target → d3e4..drop_organizer → e4f5..is_required → f5678..allow_empty_title → g6789..buffer_minutes → h7890..drop_offline_buffer → i8901..drop_time_window
 │   ├── tests/
-│   │   ├── unit/             # scheduler, ics_parser, tokens, llm 어댑터
-│   │   ├── integration/      # meeting flow, recommend
+│   │   ├── unit/             # scheduler, ics_parser, tokens, llm 어댑터 (recommend + parse_availability)
+│   │   ├── integration/      # meeting flow, recommend, delete meeting, NL parse, ICS, cancel confirm, cleanup expired, personal buffer
 │   │   └── acceptance/       # 스펙 시나리오 S1~S11 + v3 시나리오 (S1b/S12~S15)
 │   ├── Dockerfile
 │   ├── Procfile              # Railway 배포용
@@ -158,15 +181,21 @@ team31-somameet/
 │   │   │   ├── CreateMeetingPage.tsx
 │   │   │   ├── MeetingPage.tsx
 │   │   │   └── meeting/      # JoinSection, AvailabilitySection, ManualAvailabilityForm,
-│   │   │                     # IcsUploadForm, MeetingSummary, TimetableSection,
-│   │   │                     # CurrentParticipantCard, EditMeetingDialog, RecommendButton
+│   │   │                     # IcsUploadForm, NaturalLanguageAvailabilityForm,
+│   │   │                     # MeetingSummary, InviteShareRow, AutoDeleteBadge,
+│   │   │                     # SectionTitle, Participants, TimetableSection,
+│   │   │                     # CurrentParticipantCard, SelfEditModal,
+│   │   │                     # EditMeetingDialog, RecommendButton, RecommendCard
 │   │   ├── components/
-│   │   │   ├── ui/           # shadcn/ui 17개 (Joonggon 이식)
+│   │   │   ├── ui/           # shadcn/ui (label/popover/progress/separator/slot/tabs/
+│   │   │   │                 # button/input/card/calendar/dialog/alert/select/toast)
 │   │   │   ├── AvailabilityGrid.tsx     # 캘린더형 그리드 (transpose)
-│   │   │   ├── Timetable.tsx            # 캘린더형 + grid-row span 셀 병합
-│   │   │   ├── DateRangeOrPicker.tsx    # 범위/개별 선택 탭
-│   │   │   ├── CopyableUrl.tsx, QrPanel.tsx, ShareMessageDialog.tsx, CandidateList.tsx
-│   │   ├── lib/              # api, types, datetime, availabilityCells, cn
+│   │   │   ├── Timetable.tsx            # 5단계 heat ramp + grid-row span 셀 병합
+│   │   │   │                            # + mine / best / buffer hatching overlays
+│   │   │   ├── DateRangeOrPicker.tsx    # 범위/개별 선택 탭 + react-day-picker
+│   │   │   ├── CopyableUrl.tsx, QrPanel.tsx, ShareMessageDialog.tsx
+│   │   ├── lib/              # api, types, datetime, availabilityCells, meetingTitle,
+│   │   │                     # participantSession, cn
 │   │   └── App.tsx
 │   ├── tests/e2e/            # Playwright (E1_full_flow.spec.ts)
 │   ├── vercel.json
@@ -266,15 +295,18 @@ docker compose up --build
 | `POST` | `/api/meetings` | 누구나 | 회의 생성 (range / picked 모드) |
 | `GET` | `/api/meetings/{slug}` | URL만 | 회의 상세 + 진행률 + `submitted_nicknames` + `required_nicknames` + 본인 `my_busy_blocks` |
 | `PATCH` | `/api/meetings/{slug}/settings` | URL만 (확정 전) | 회의 설정 수정. 확정 후 호출 시 409 `already_confirmed` |
+| `DELETE` | `/api/meetings/{slug}` | URL만 | 회의 삭제 (Phase E). 204 No Content, cascade로 Participant·BusyBlock까지 정리. FE 2단계 다이얼로그가 안전망 |
 | `POST` | `/api/meetings/{slug}/calculate` | URL만 (1명+ 제출) | 결정론적 후보 (LLM 0회) |
 | `POST` | `/api/meetings/{slug}/recommend` | URL만 (1명+ 제출) | LLM 1회 + 재시도 최대 3회 + 후보별 reason/share_message_draft |
 | `POST` | `/api/meetings/{slug}/confirm` | URL만 | 시각 확정 + 공유 메시지 저장. race 시 409 `already_confirmed` |
+| `DELETE` | `/api/meetings/{slug}/confirm` | URL만 | 확정 취소 (v3.27, issue #24). 회의 시작 이후 호출 시 409 `cannot_cancel_after_meeting_start` |
 | `POST` | `/api/meetings/{slug}/participants` | 누구나 | 등록 — PIN 매칭 시 재진입(login) 통합 처리 |
 | `POST` | `/api/meetings/{slug}/participants/login` | PIN 보유자 | PIN 재진입 (frontend는 더 이상 호출 안 함, API 호환용으로 유지) |
 | `PATCH` | `/api/meetings/{slug}/participants/me` | 본인 쿠키 | 닉네임/PIN/`is_required` 토글 (`exclude_unset` 기반 부분 업데이트) |
 | `POST` | `/api/meetings/{slug}/availability/manual` | 본인 쿠키 | 수동 가용 시간 제출 (last-write-wins, 빈 제출 허용) |
 | `POST` | `/api/meetings/{slug}/availability/ics/parse` | 본인 쿠키 | ICS 파일 파싱만 (DB 저장 없음). frontend가 manual 그리드에 pre-fill |
 | `POST` | `/api/meetings/{slug}/availability/ics` | 본인 쿠키 | (legacy) ICS 즉시 commit. frontend 미사용, 외부 호환용 유지 |
+| `POST` | `/api/meetings/{slug}/availability/natural-language/parse` | 본인 쿠키 | 자연어 가용 텍스트 파싱 (Phase D, v3.28). LLM이 `busy_blocks` + `summary` + chip용 `recognized_phrases` 생성. preview-only |
 | `GET` | `/api/meetings/{slug}/timetable` | URL만 | 시간대별 가용 인원 |
 | `GET` | `/api/health` | 누구나 | 헬스체크 |
 
@@ -293,7 +325,9 @@ docker compose up --build
 | `candidate_not_in_windows` | 400 | 후보가 추천 windows 밖 |
 | `slot_not_on_grid` / `slot_duration_mismatch` / `slot_out_of_range` | 400 | 확정 슬롯 검증 실패 |
 | `already_confirmed` | 409 | 이미 확정된 회의 (race 보호) |
+| `cannot_cancel_after_meeting_start` | 409 | 확정 슬롯이 이미 과거 → DELETE /confirm 거부 |
 | `llm_unavailable` | 503 | LLM 호출 불가 (template 전환 권장) |
+| `llm_parse_failed` | 500 | 자연어 파싱 응답이 JSON 디코드 실패 |
 | `slug_collision` | 503 | slug 생성 5회 재시도 실패 |
 
 ---
@@ -305,9 +339,9 @@ docker compose up --build
 ```bash
 cd backend
 pip install -e ".[dev]"
-pytest                          # 전체 (현재 114 passed, 1 skipped)
+pytest                          # 전체 (현재 174 passed, 1 skipped)
 pytest -m unit                  # scheduler, ICS 파서, 토큰, LLM 어댑터
-pytest -m integration           # meeting flow, recommend
+pytest -m integration           # meeting flow, recommend, delete meeting, NL parse
 pytest -m acceptance            # S1~S11 + S1b + S12~S15 시나리오
 ```
 
@@ -327,13 +361,14 @@ E1은 골든패스 + 캘린더형 타임테이블의 `grid-row span` 셀 병합 
 
 ## 사용자 흐름 (3분 데모)
 
-1. `/`에서 회의 생성 — 제목, 날짜(범위 탭 또는 개별 선택 탭), 회의 길이(30~180분), 진행 방식(온라인/오프라인/상관없음), 이동 버퍼(0~120분), 시작·종료 시간
+1. `/`에서 회의 생성 — 제목 (선택), 날짜(범위 탭 또는 개별 선택 탭), 회의 길이(30~180분), 진행 방식(온라인/오프라인/상관없음). 이동 버퍼는 회의 생성 단계 대신 **참여자 본인 등록 후 SelfCard 의 BufferChips 에서 직접 선택** (0/30/60/90/120, per-participant)
 2. 생성 즉시 `/m/{slug}`로 이동. 회의 페이지 상단에 **공유 URL + QR 코드**
 3. 참여자 단일 폼: **닉네임 + 4자리 PIN(선택) + 필수 참여자 체크박스(선택)**
    - 같은 닉네임 + PIN 입력 시 자동 재진입(login) 처리
 4. 가용 시간 입력
    - **직접 입력 탭**: 30분 단위 캘린더형 그리드 드래그
    - **ICS 탭**: 파일 선택 → "ICS 불러오기" → 자동으로 직접 입력 탭 점프 + 그리드에 pre-fill → 검토/수정 → "가용 시간 저장"
+   - **자연어 탭** (Phase D, v3.28): "월요일 9-12 수업 있음" 같은 한국어 입력 → LLM이 `busy_blocks` + 인식한 표현(`recognized_phrases` chip) 미리보기 → 합치기/덮어쓰기 선택 → 그리드 검토/수정 → 저장
 5. 5초 polling으로 다른 참여자 제출 즉시 반영. 제출자 chip(★ 필수 / ✓ 일반)과 "필수 미제출" 경고가 함께 표시
 6. **결과 보기** — deterministic 후보. 한 번 더 보고 싶으면 **추천받기**(LLM, 5분 쿨타임)
 7. 후보 선택 → 메시지 검토 다이얼로그(2단계 게이트) → 확정 → 공유 메시지 복사
@@ -347,10 +382,10 @@ E1은 골든패스 + 캘린더형 타임테이블의 `grid-row span` 셀 병합 
 - DB 스키마에 이벤트 제목/장소/설명 컬럼 **없음** (`busy_blocks` 테이블은 `start_at`, `end_at`만 보유)
 - ICS 파서가 시작/종료 시간만 추출하고 SUMMARY/LOCATION/DESCRIPTION을 폐기
 - LLM 호출 payload에 포함되는 항목:
-  - 회의 메타데이터: `title`, `location_type`, `duration_minutes`, `offline_buffer_minutes`
-  - candidate windows: 시작/종료 시각, available_count, available/unavailable 닉네임
-- LLM payload에 절대 포함되지 않는 항목: 이벤트 제목, 장소, 설명, 외부 캘린더 토큰
-- `tests/acceptance/test_acceptance_S1_S11.py` S11 시나리오가 prompt spy로 invariant를 강제
+  - `/recommend`: 회의 메타데이터 (`title`, `location_type`, `duration_minutes`) + candidate windows (시작/종료 시각, available_count, available/unavailable 닉네임) + `required_participants` 닉네임 리스트
+  - `/availability/natural-language/parse` (Phase D): 회의 `title` + 검색 대상 `dates` + 시간 윈도우 (`window_start`, `window_end_inclusive`) + 참여자 자신이 입력한 자연어 텍스트
+- LLM payload에 절대 포함되지 않는 항목: 이벤트 제목, 장소, 설명, 외부 캘린더 토큰, **다른 참여자의 busy_blocks**, 참여자 ID/이메일
+- `tests/acceptance/test_acceptance_S1_S11.py` S11과 `tests/unit/test_llm_parse_availability.py`가 prompt spy + payload-key 잠금으로 invariant를 강제 (참가자 ID·busy_blocks·이벤트 텍스트가 어댑터로 흘러가지 않음을 단언)
 
 `my_busy_blocks` 응답은 본인 쿠키 보유자에게만 자기 자신의 블록을 노출합니다 (cross-leak 없음). 미제출 참여자는 `null` 반환으로 "첫 진입 시 그리드 100% 채움" 버그를 방지합니다 (v3.25).
 

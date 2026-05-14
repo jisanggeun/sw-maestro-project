@@ -23,10 +23,10 @@ v3.2 (2026-05-06 organizer gate removed, Path B):
 """
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Optional
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, Integer, String, Text, Time
+from sqlalchemy import JSON, Boolean, Date, DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -41,7 +41,9 @@ class Meeting(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     slug: Mapped[str] = mapped_column(String(8), unique=True, nullable=False, index=True)
 
-    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    title: Mapped[str] = mapped_column(
+        String(200), nullable=False, server_default="", default=""
+    )
 
     # v3 — date_mode + nullable range + picked dates list (Q5).
     date_mode: Mapped[str] = mapped_column(
@@ -54,13 +56,14 @@ class Meeting(Base):
     duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
     location_type: Mapped[str] = mapped_column(String(10), nullable=False)
 
-    # v3 — variable offline buffer (Q8). 30 / 60 / 90 / 120.
-    offline_buffer_minutes: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default="30", default=30
-    )
+    # Issue #13 follow-up — meeting-level offline_buffer_minutes was dropped.
+    # Buffer is now strictly per-participant (Participant.buffer_minutes), with
+    # a hard-coded default in app.services.scheduler.DEFAULT_BUFFER_MINUTES.
 
-    time_window_start: Mapped[time] = mapped_column(Time, nullable=False)
-    time_window_end: Mapped[time] = mapped_column(Time, nullable=False)
+    # Issue #57 — time_window_start / time_window_end columns dropped.
+    # All meetings now share a fixed 06:00-24:00 search window defined by
+    # MEETING_WINDOW_START / MEETING_WINDOW_END in app.services.scheduler.
+
     include_weekends: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     confirmed_slot_start: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

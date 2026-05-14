@@ -15,9 +15,6 @@ export interface MeetingCreateRequest {
   candidate_dates: string[] | null
   duration_minutes: number
   location_type: LocationType
-  offline_buffer_minutes: number
-  time_window_start: string // HH:MM
-  time_window_end: string // HH:MM
   include_weekends: boolean
 }
 
@@ -39,9 +36,6 @@ export interface MeetingSettingsUpdate {
   candidate_dates: string[] | null
   duration_minutes: number
   location_type: LocationType
-  offline_buffer_minutes: number
-  time_window_start: string
-  time_window_end: string
   include_weekends: boolean
 }
 
@@ -63,9 +57,6 @@ export interface MeetingDetail {
   required_nicknames?: string[]
   is_ready_to_calculate: boolean
   location_type: LocationType
-  offline_buffer_minutes: number
-  time_window_start: string
-  time_window_end: string
   include_weekends: boolean
   share_url: string
   // v3.6: present (and possibly empty []) when the caller has the participant
@@ -74,6 +65,11 @@ export interface MeetingDetail {
   confirmed_slot: ConfirmedSlot | null
   confirmed_share_message: string | null
   created_at?: string
+  // #32 — 회의 자동 삭제 예정 시각 (ISO 8601 with KST offset). 미지원 응답에선 omit.
+  expires_at?: string
+  // #13 — 본인 참여자의 개인 이동 버퍼(분). null = 시스템 기본값(60분) 사용.
+  // anonymous 호출 시 undefined.
+  my_buffer_minutes?: number | null
 }
 
 export interface BusyBlock {
@@ -84,6 +80,7 @@ export interface BusyBlock {
 export interface ParticipantResponse {
   participant_id: number
   nickname: string
+  token?: string
 }
 
 // Backwards-compat alias.
@@ -93,6 +90,9 @@ export interface ParticipantJoinRequest {
   nickname: string
   pin?: string | null
   is_required?: boolean
+  // #13 — buffer-on-join. 등록 시 필수. online 회의면 FE 가 0 으로 하드코딩.
+  // 값: 0/30/60/90/120 분.
+  buffer_minutes: number
 }
 
 export interface ParticipantLoginRequest {
@@ -114,6 +114,15 @@ export interface IcsErrorResponse {
   error_code: string
   message: string
   suggestion?: string
+}
+
+export interface NaturalLanguageParseResponse {
+  busy_blocks: { start: string; end: string }[]
+  summary: string
+  // Phase D — optional list of recognized phrases (e.g. "월 9-12시 불가") to
+  // surface as chips in the NL preview. BE may omit this; FE hides the chip
+  // row when missing or empty.
+  recognized_phrases?: string[]
 }
 
 export interface Candidate {

@@ -24,7 +24,8 @@ from app.services.llm.upstage import UpstageAdapter
 from app.services.scheduler import CandidateWindow
 
 
-def _meeting(buffer: int = 30) -> Meeting:
+def _meeting(buffer: int = 30) -> Meeting:  # noqa: ARG001 — kept for call-site compat
+    # #13 follow-up: meeting-level offline_buffer_minutes was dropped.
     return Meeting(
         slug="abc12345",
         title="팀 회의",
@@ -34,9 +35,6 @@ def _meeting(buffer: int = 30) -> Meeting:
         candidate_dates=None,
         duration_minutes=60,
         location_type="offline",
-        offline_buffer_minutes=buffer,
-        time_window_start=time(9, 0),
-        time_window_end=time(22, 0),
         include_weekends=False,
         created_at=datetime(2026, 5, 4),
     )
@@ -85,7 +83,12 @@ def test_build_payload_contains_no_event_titles(monkeypatch) -> None:
 def test_payload_top_level_keys_locked(monkeypatch) -> None:
     adapter = _instantiate_adapter(monkeypatch)
     payload = adapter.build_recommendation_payload(_windows(), _meeting(), 3)
-    assert set(payload.keys()) == {"meeting", "rules", "candidate_windows"}
+    assert set(payload.keys()) == {
+        "meeting",
+        "rules",
+        "candidate_windows",
+        "required_participants",
+    }
 
 
 def test_payload_meeting_keys_locked(monkeypatch) -> None:
@@ -95,7 +98,6 @@ def test_payload_meeting_keys_locked(monkeypatch) -> None:
         "title",
         "location_type",
         "duration_minutes",
-        "offline_buffer_minutes",
     }
 
 

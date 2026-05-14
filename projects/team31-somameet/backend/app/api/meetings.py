@@ -1,10 +1,11 @@
 """Meeting CRUD + calculate + confirm endpoints (v3).
 
 Endpoints:
-- POST /api/meetings           — create meeting (range or picked mode)
-- GET  /api/meetings/{slug}    — public detail with submitted/target progress
-- POST /api/meetings/{slug}/calculate — deterministic candidates only (NO LLM call)
-- POST /api/meetings/{slug}/confirm   — slug-only, stores share_message_draft
+- POST   /api/meetings           — create meeting (range or picked mode)
+- GET    /api/meetings/{slug}    — public detail with submitted/target progress
+- POST   /api/meetings/{slug}/calculate — deterministic candidates only (NO LLM call)
+- POST   /api/meetings/{slug}/confirm   — slug-only, stores share_message_draft
+- DELETE /api/meetings/{slug}/confirm   — issue #24, cancel a confirmation
 
 v3 changes:
 - /calculate is deterministic-only (LLM moved to /recommend).
@@ -27,7 +28,7 @@ import logging
 from datetime import timedelta
 from typing import List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -57,6 +58,7 @@ from app.services.scheduler import (
     deterministic_top_candidates,
     generate_candidate_windows,
 )
+from app.services.expiry import meeting_expires_at
 from app.services.timezones import from_kst_naive, now_kst_naive, to_kst_naive
 from app.services.tokens import generate_slug
 
@@ -92,9 +94,6 @@ def create_meeting(
             candidate_dates=candidate_dates_iso,
             duration_minutes=payload.duration_minutes,
             location_type=payload.location_type.value,
-            offline_buffer_minutes=payload.offline_buffer_minutes,
-            time_window_start=payload.time_window_start,
-            time_window_end=payload.time_window_end,
             include_weekends=payload.include_weekends,
             created_at=now_kst_naive(),
         )
@@ -131,6 +130,24 @@ def get_meeting(
     db: Session = Depends(get_db),
 ) -> MeetingDetail:
     settings = get_settings()
+
+    # Issue #32 — lazy cleanup. Catches the gap between container startup
+    # and the first hourly sweep in the lifespan loop. Cascade handles
+    # Participant + BusyBlock; after delete we return 404 so the client sees
+    # the same shape as any other missing meeting.
+    expires_at = meeting_expires_at(meeting)
+    if expires_at <= now_kst_naive():
+        db.delete(meeting)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error_code": "meeting_not_found",
+                "message": "회의를 찾을 수 없습니다.",
+                "suggestion": "URL을 다시 확인해주세요.",
+            },
+        )
+
     submitted = count_submitted(db, meeting.id)
     submitted_names = list_submitted_nicknames(db, meeting.id)
     required_names = list_required_nicknames(db, meeting.id)
@@ -144,6 +161,7 @@ def get_meeting(
     #     Frontend pre-fills the grid as fully available.
     # This split fixes the "first visit shows the grid completely filled" bug.
     me = get_optional_participant(request, meeting.slug, db)
+    my_buffer_minutes: Optional[int] = me.buffer_minutes if me is not None else None
     my_busy_blocks: Optional[List[ConfirmedSlotInfo]] = None
     if me is not None and me.confirmed_at is not None:
         rows = (
@@ -192,16 +210,40 @@ def get_meeting(
         required_nicknames=required_names,
         is_ready_to_calculate=submitted >= 1,
         location_type=meeting.location_type,
-        offline_buffer_minutes=meeting.offline_buffer_minutes,
-        time_window_start=meeting.time_window_start,
-        time_window_end=meeting.time_window_end,
         include_weekends=meeting.include_weekends,
         share_url=f"{settings.APP_BASE_URL.rstrip('/')}/m/{meeting.slug}",
+        expires_at=from_kst_naive(expires_at),
         confirmed_slot=confirmed_info,
         confirmed_share_message=meeting.confirmed_share_message,
         my_busy_blocks=my_busy_blocks,
+        my_buffer_minutes=my_buffer_minutes,
         created_at=from_kst_naive(meeting.created_at),
     )
+
+
+@router.delete(
+    "/meetings/{slug}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+def delete_meeting(
+    meeting: Meeting = Depends(get_current_meeting),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Phase E — delete a meeting room outright (SettingsModal "회의 삭제").
+
+    v3.2 Path B: anyone with the slug may delete. The FE 2-step
+    confirmation dialog is the sole accident safeguard.
+
+    Cascades to Participant rows (Meeting.participants relationship is
+    delete-orphan) and from there to BusyBlock rows (Participant.busy_blocks
+    is delete-orphan as well, and the FK also has ondelete=CASCADE at the
+    DB level), so a single db.delete + commit cleans the whole subtree.
+    Mirrors the lazy-expiry cleanup path at GET /meetings/{slug}.
+    """
+    db.delete(meeting)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.patch("/meetings/{slug}/settings", response_model=MeetingDetail)
@@ -237,9 +279,6 @@ def update_meeting_settings(
     )
     meeting.duration_minutes = payload.duration_minutes
     meeting.location_type = payload.location_type.value
-    meeting.offline_buffer_minutes = payload.offline_buffer_minutes
-    meeting.time_window_start = payload.time_window_start
-    meeting.time_window_end = payload.time_window_end
     meeting.include_weekends = payload.include_weekends
 
     db.add(meeting)
@@ -359,6 +398,69 @@ def confirm(
         ),
         share_message_draft=payload.share_message_draft,
     )
+
+
+@router.delete("/meetings/{slug}/confirm", response_model=MeetingDetail)
+def cancel_confirm(
+    request: Request,
+    meeting: Meeting = Depends(get_current_meeting),
+    db: Session = Depends(get_db),
+) -> MeetingDetail:
+    """v3.27 (issue #24) — undo a confirmation.
+
+    Path B: anyone with the slug may cancel. Resets confirmed_slot_start /
+    confirmed_slot_end / confirmed_share_message back to NULL. Once cleared,
+    PATCH /settings is editable again and POST /confirm becomes valid again.
+
+    Behavior:
+    - Confirmed slot already in the past → 409 cannot_cancel_after_meeting_start
+      (회의가 이미 시작된 뒤에는 되돌릴 수 없음).
+    - Not currently confirmed → idempotent 200 + current MeetingDetail.
+    - Confirmed and slot is still in the future → reset the 3 fields, 200 +
+      MeetingDetail.
+
+    Race protection mirrors POST /confirm (with_for_update on non-SQLite).
+    """
+    locked = (
+        db.query(Meeting).filter(Meeting.id == meeting.id).with_for_update().first()
+        if db.bind and db.bind.dialect.name != "sqlite"
+        else db.query(Meeting).filter(Meeting.id == meeting.id).first()
+    )
+    if locked is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error_code": "meeting_not_found",
+                "message": "회의를 찾을 수 없습니다.",
+                "suggestion": "URL을 다시 확인해주세요.",
+            },
+        )
+
+    if locked.confirmed_slot_start is None:
+        return get_meeting(request=request, meeting=locked, db=db)
+
+    if locked.confirmed_slot_start <= now_kst_naive():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error_code": "cannot_cancel_after_meeting_start",
+                "message": "이미 시작된 회의는 취소할 수 없습니다.",
+                "suggestion": "회의 시작 전에만 확정을 취소할 수 있습니다.",
+                "confirmed_slot": {
+                    "start": from_kst_naive(locked.confirmed_slot_start).isoformat(),
+                    "end": from_kst_naive(locked.confirmed_slot_end).isoformat(),
+                },
+            },
+        )
+
+    locked.confirmed_slot_start = None
+    locked.confirmed_slot_end = None
+    locked.confirmed_share_message = None
+    db.add(locked)
+    db.commit()
+    db.refresh(locked)
+
+    return get_meeting(request=request, meeting=locked, db=db)
 
 
 # ============================================================================

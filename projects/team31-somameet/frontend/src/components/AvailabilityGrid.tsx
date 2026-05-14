@@ -2,14 +2,16 @@
 // v3.4: rows = 30-min times, columns = dates (구글 캘린더 주간 뷰처럼).
 // Default = unselected (white). Drag to mark cells available (primary).
 
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import type { MeetingDetail } from "@/lib/types"
 import {
+  cellsToRanges,
   formatDateLabel,
   getMeetingDates,
   getMeetingTimes,
   isOnHour,
   makeCellKey,
+  minutesToTime,
 } from "@/lib/availabilityCells"
 import { cn } from "@/lib/cn"
 
@@ -17,15 +19,43 @@ interface AvailabilityGridProps {
   meeting: MeetingDetail
   value: Set<string>
   onChange: (next: Set<string>) => void
+  // #13 — 본인 적용 buffer (분). online 회의 = 0. 선택된 range 양 끝 buffer 분량 셀에 음영.
+  bufferMinutes?: number
 }
+
+const SLOT_MINUTES = 30
 
 type PaintMode = "selecting" | "deselecting" | null
 type DateSelectionState = "none" | "partial" | "all"
 
-export function AvailabilityGrid({ meeting, value, onChange }: AvailabilityGridProps) {
+export function AvailabilityGrid({
+  meeting,
+  value,
+  onChange,
+  bufferMinutes = 0,
+}: AvailabilityGridProps) {
   const dates = getMeetingDates(meeting)
   const times = getMeetingTimes(meeting)
 
+  // #13 — 선택된 cell 들의 연속 range 양 끝 buffer 분량 cell 집합 미리 계산.
+  // range 길이 < buffer*2 이면 전체가 buffer cell.
+  const bufferCellKeys = useMemo(() => {
+    const out = new Set<string>()
+    if (bufferMinutes <= 0) return out
+    const ranges = cellsToRanges(value)
+    for (const r of ranges) {
+      const headEnd = Math.min(r.endMin, r.startMin + bufferMinutes)
+      const tailStart = Math.max(r.startMin, r.endMin - bufferMinutes)
+      for (let m = r.startMin; m < r.endMin; m += SLOT_MINUTES) {
+        if (m < headEnd || m >= tailStart) {
+          out.add(makeCellKey(r.date, minutesToTime(m)))
+        }
+      }
+    }
+    return out
+  }, [value, bufferMinutes])
+
+  const containerRef = useRef<HTMLDivElement>(null)
   const paintModeRef = useRef<PaintMode>(null)
   const touchedRef = useRef<Set<string>>(new Set())
   const liveSelectedRef = useRef<Set<string>>(value)
@@ -46,6 +76,20 @@ export function AvailabilityGrid({ meeting, value, onChange }: AvailabilityGridP
       window.removeEventListener("touchend", endPaint)
       window.removeEventListener("touchcancel", endPaint)
       document.body.style.userSelect = ""
+    }
+  }, [])
+
+  // #29/#31 — paint 중에만 vertical pan 차단. React 의 onTouchMove 는 root 에 passive 로
+  // 등록되어 preventDefault() 가 무시되므로 native non-passive listener 로 직접 등록.
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const onTouchMove = (e: TouchEvent) => {
+      if (paintModeRef.current) e.preventDefault()
+    }
+    el.addEventListener("touchmove", onTouchMove, { passive: false })
+    return () => {
+      el.removeEventListener("touchmove", onTouchMove)
     }
   }, [])
 
@@ -151,8 +195,9 @@ export function AvailabilityGrid({ meeting, value, onChange }: AvailabilityGridP
 
   return (
     <div
+      ref={containerRef}
       data-testid="availability-grid"
-      className="max-h-[520px] overflow-auto rounded-xl border border-border bg-card p-2"
+      className="max-h-[520px] overflow-auto overscroll-contain rounded-xl border border-border bg-card p-2"
       onScroll={handleScroll}
       onTouchMove={handleTouchMove}
     >
@@ -209,6 +254,7 @@ export function AvailabilityGrid({ meeting, value, onChange }: AvailabilityGridP
             time={time}
             dates={dates}
             value={value}
+            bufferCellKeys={bufferCellKeys}
             onMouseDown={handleMouseDown}
             onMouseEnter={handleMouseEnter}
             onTouchStart={handleTouchStart}
@@ -223,12 +269,21 @@ interface TimeRowProps {
   time: string
   dates: string[]
   value: Set<string>
+  bufferCellKeys: Set<string>
   onMouseDown: (e: React.MouseEvent<HTMLButtonElement>, key: string) => void
   onMouseEnter: (key: string) => void
   onTouchStart: (e: React.TouchEvent<HTMLButtonElement>, key: string) => void
 }
 
-function TimeRow({ time, dates, value, onMouseDown, onMouseEnter, onTouchStart }: TimeRowProps) {
+function TimeRow({
+  time,
+  dates,
+  value,
+  bufferCellKeys,
+  onMouseDown,
+  onMouseEnter,
+  onTouchStart,
+}: TimeRowProps) {
   return (
     <>
       <div
@@ -244,6 +299,7 @@ function TimeRow({ time, dates, value, onMouseDown, onMouseEnter, onTouchStart }
       {dates.map((date) => {
         const key = makeCellKey(date, time)
         const selected = value.has(key)
+        const isBufferCell = selected && bufferCellKeys.has(key)
         return (
           <button
             key={key}
@@ -256,12 +312,24 @@ function TimeRow({ time, dates, value, onMouseDown, onMouseEnter, onTouchStart }
             onMouseEnter={() => onMouseEnter(key)}
             onTouchStart={(e) => onTouchStart(e, key)}
             className={cn(
-              "h-6 cursor-pointer rounded-sm transition-colors",
+              "relative h-6 cursor-pointer touch-none rounded-sm transition-colors",
               selected
-                ? "bg-primary shadow-[inset_0_0_0_1px_rgba(255,255,255,0.18)] hover:bg-primary/85"
+                ? "bg-primary hover:bg-primary/85"
                 : "border border-border bg-background hover:bg-primary/15",
             )}
-          />
+          >
+            {isBufferCell ? (
+              <span
+                aria-hidden
+                data-testid={`buffer-shadow-${date}-${time}`}
+                className="pointer-events-none absolute inset-0 rounded-sm"
+                style={{
+                  backgroundImage:
+                    "repeating-linear-gradient(45deg, rgba(255,255,255,0.4) 0 4px, transparent 4px 8px)",
+                }}
+              />
+            ) : null}
+          </button>
         )
       })}
     </>

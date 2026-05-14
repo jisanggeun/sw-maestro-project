@@ -1,61 +1,47 @@
-// MeetingPage — Spec §6 vertical order:
-//   1. MeetingSummary (title/date/duration/target/location/buffer + progress)
-//   2. JoinSection (only when no participant cookie/nickname yet) — nickname + optional PIN + login foldout
-//   3. AvailabilitySection (after join — manual / ICS tabs)
-//   4. TimetableSection (horizontal grid)
-//   5. ResultSection: [결과 보기] / [추천받기], CandidateList, ConfirmSection
+// MeetingPage — Spec §6 vertical order.
 //
-// v3.2 (2026-05-06 Path B): organizer_token concept retired entirely. Anyone
-// with the slug (= share URL) can run calculate / recommend / confirm. The
-// 2-step ShareMessageDialog is the sole accident safeguard.
+// v4 (2026-05-13) Soma redesign:
+//   - Phase C1: TopBar, MeetingSummary, CurrentParticipantCard, Participants
+//   - Phase C2: Timetable heat ramp / mine / best / buffer hatching
+//   - Phase C3: sticky sidebar = RecommendCard + Participants. Result state
+//     (calculate / recommend) lives here so the card can sit in the sidebar
+//     while Timetable receives bestSlots in the main column.
+//
+// Data flow (preserved):
+//   - useEffect 5-sec polling while !confirmed
+//   - participantSession cookie / nickname
+//   - ShareMessageDialog post-confirm round-trip (readOnly)
 
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { Link, useParams } from "react-router-dom"
-import { ApiError, type Candidate, type ConfirmResponse, type MeetingDetail } from "@/lib/types"
+import {
+  ApiError,
+  type CalculateResponse,
+  type Candidate,
+  type ConfirmResponse,
+  type MeetingDetail,
+  type RecommendResponse,
+} from "@/lib/types"
 import { api } from "@/lib/api"
 import { MeetingSummary } from "./meeting/MeetingSummary"
 import { JoinSection } from "./meeting/JoinSection"
 import { CurrentParticipantCard } from "./meeting/CurrentParticipantCard"
 import { AvailabilitySection } from "./meeting/AvailabilitySection"
 import { TimetableSection } from "./meeting/TimetableSection"
+import { Participants } from "./meeting/Participants"
+import { RecommendCard, type RecommendCardResultState } from "./meeting/RecommendCard"
 import { ShareMessageDialog } from "@/components/ShareMessageDialog"
+import { useToast } from "@/components/ui/toast"
 import { formatKstRange } from "@/lib/datetime"
-import { cn } from "@/lib/cn"
-
-// Layout breakpoint: when the meeting has many dates, the timetable + grid get
-// too wide for a 2-col split — fall back to a single-column stack.
-const TWO_COL_DATE_LIMIT = 5
-
-function countMeetingDates(meeting: MeetingDetail): number {
-  if (meeting.date_mode === "range") {
-    if (!meeting.date_range_start || !meeting.date_range_end) return 0
-    const start = new Date(`${meeting.date_range_start}T00:00:00`)
-    const end = new Date(`${meeting.date_range_end}T00:00:00`)
-    return Math.max(1, Math.round((end.getTime() - start.getTime()) / 86_400_000) + 1)
-  }
-  return meeting.candidate_dates?.length ?? 0
-}
-
-const PARTICIPANT_LS_KEY = (slug: string) => `somameet_pt_local_${slug}`
-
-function readParticipantNickname(slug: string): string | null {
-  try {
-    return window.localStorage.getItem(PARTICIPANT_LS_KEY(slug))
-  } catch {
-    return null
-  }
-}
-
-function writeParticipantNickname(slug: string, nickname: string) {
-  try {
-    window.localStorage.setItem(PARTICIPANT_LS_KEY(slug), nickname)
-  } catch {
-    /* ignore */
-  }
-}
+import {
+  clearParticipantSession,
+  readParticipantNickname,
+  writeParticipantSession,
+} from "@/lib/participantSession"
 
 export default function MeetingPage() {
   const { slug } = useParams<{ slug: string }>()
+  const { toast } = useToast()
 
   const [meeting, setMeeting] = useState<MeetingDetail | null>(null)
   const [loading, setLoading] = useState(true)
@@ -69,6 +55,17 @@ export default function MeetingPage() {
     message: string
     rangeLabel: string
   }>({ open: false, message: "", rangeLabel: "" })
+
+  // Phase C3 — result state lives at the page level so RecommendCard (sidebar)
+  // and Timetable (main column) can both read it.
+  const [result, setResult] = useState<RecommendCardResultState>({ kind: "idle" })
+  const [calculating, setCalculating] = useState(false)
+  const [recommending, setRecommending] = useState(false)
+  const [resultError, setResultError] = useState<string | null>(null)
+  // Candidate the user just picked — flows down to TimetableSection which
+  // opens the ShareMessageDialog. The section clears it via onPickedHandled
+  // after consumption so re-picking the same slot is possible.
+  const [pickedCandidate, setPickedCandidate] = useState<Candidate | null>(null)
 
   const reloadMeeting = useCallback(async () => {
     if (!slug) return
@@ -94,25 +91,19 @@ export default function MeetingPage() {
   }, [reloadMeeting])
 
   const onJoined = useCallback(
-    (nickname: string) => {
-      if (slug) writeParticipantNickname(slug, nickname)
+    (nickname: string, token?: string) => {
+      if (slug) writeParticipantSession(slug, nickname, token)
       setParticipantNickname(nickname)
       void reloadMeeting()
     },
     [slug, reloadMeeting],
   )
 
-  const useTwoColumnLayout = useMemo(
-    () => (meeting ? countMeetingDates(meeting) <= TWO_COL_DATE_LIMIT : true),
-    [meeting],
-  )
-
   // v3.10 — soft real-time: poll meeting + timetable every 5s while the tab is
-  // visible and the meeting hasn't been confirmed. ManualAvailabilityForm is
-  // hardened so user-mid-edit selection isn't overwritten on each tick.
+  // visible and the meeting hasn't been confirmed.
   useEffect(() => {
     if (!slug) return
-    if (meeting?.confirmed_slot) return // confirmed = no further sync needed
+    if (meeting?.confirmed_slot) return
 
     const POLL_INTERVAL_MS = 5_000
     let cancelled = false
@@ -125,7 +116,6 @@ export default function MeetingPage() {
     }
     const id = window.setInterval(tick, POLL_INTERVAL_MS)
 
-    // Refetch immediately when the tab regains focus (catch up on missed updates).
     const onVis = () => {
       if (typeof document !== "undefined" && !document.hidden) tick()
     }
@@ -144,7 +134,6 @@ export default function MeetingPage() {
 
   const onConfirmed = useCallback(
     (response: ConfirmResponse, candidate: Candidate) => {
-      // Show a read-only "공유 메시지" dialog right after the confirm round-trips.
       setConfirmedDialog({
         open: true,
         message: response.share_message_draft,
@@ -155,8 +144,69 @@ export default function MeetingPage() {
     [reloadMeeting],
   )
 
-  // v3.2 (Path B): no organizer/participant split anywhere. The
-  // ShareMessageDialog 2-step gate is the only accident safeguard now.
+  const handleCancelConfirm = useCallback(async () => {
+    if (!slug) return
+    try {
+      const updated = await api.cancelConfirm(slug)
+      setMeeting(updated)
+      setRefreshKey((k) => k + 1)
+      setConfirmedDialog((prev) => ({ ...prev, open: false }))
+      toast("회의 확정이 취소되었습니다.", "success")
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : "확정 취소에 실패했습니다."
+      toast(msg, "error")
+      throw err
+    }
+  }, [slug, toast])
+
+  const handleSwitchUser = useCallback(() => {
+    if (slug) clearParticipantSession(slug)
+    setParticipantNickname(null)
+    void reloadMeeting()
+  }, [slug, reloadMeeting])
+
+  const handleCalculate = useCallback(async () => {
+    if (!slug) return
+    setCalculating(true)
+    setResultError(null)
+    try {
+      const res: CalculateResponse = await api.calculate(slug)
+      setResult({ kind: "calculate", response: res })
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : "계산에 실패했습니다."
+      setResultError(msg)
+      toast(msg, "error")
+    } finally {
+      setCalculating(false)
+    }
+  }, [slug, toast])
+
+  const handleRecommendResult = useCallback((res: RecommendResponse) => {
+    setResult({ kind: "recommend", response: res })
+    setResultError(null)
+  }, [])
+
+  const handlePick = useCallback((candidate: Candidate) => {
+    setPickedCandidate(candidate)
+  }, [])
+
+  const slugFootnote = useMemo(
+    () => (meeting ? `slug: ${meeting.slug}` : null),
+    [meeting],
+  )
+
+  const bestSlots = useMemo(() => {
+    if (result.kind !== "recommend") return undefined
+    return (result.response.candidates ?? []).map((c) => ({
+      start: c.start,
+      end: c.end,
+    }))
+  }, [result])
+
+  const ready = useMemo(() => {
+    if (!meeting) return false
+    return meeting.is_ready_to_calculate ?? (meeting.submitted_count ?? 0) >= 1
+  }, [meeting])
 
   if (!slug) {
     return (
@@ -193,87 +243,91 @@ export default function MeetingPage() {
     )
   }
 
-  function handleSwitchUser() {
-    if (slug) {
-      try {
-        window.localStorage.removeItem(PARTICIPANT_LS_KEY(slug))
-      } catch {
-        /* ignore */
-      }
-    }
-    setParticipantNickname(null)
-    void reloadMeeting()
-  }
-
   return (
-    <main className="linear-container flex min-h-screen flex-col gap-6 py-10 sm:py-14">
-      <header className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <Link
-            to="/"
-            className="text-xs text-muted-foreground underline-offset-2 hover:text-primary hover:underline"
-            data-testid="back-to-home"
-          >
-            ← 홈으로
-          </Link>
-          <h1 className="mt-1 font-display text-[clamp(24px,3.2vw,36px)] font-semibold leading-[1.15] tracking-[-1px] text-foreground">
-            {meeting.title}
-          </h1>
-          <p className="mt-1 font-mono text-xs text-muted-foreground">slug: {meeting.slug}</p>
-        </div>
-        {participantNickname ? (
-          <CurrentParticipantCard
-            slug={slug}
-            nickname={participantNickname}
-            isRequired={(meeting.required_nicknames ?? []).includes(participantNickname)}
-            onRenamed={(newName) => {
-              writeParticipantNickname(slug, newName)
-              setParticipantNickname(newName)
-              void reloadMeeting()
-            }}
-            onSwitchUser={handleSwitchUser}
-          />
-        ) : null}
-      </header>
-
-      <MeetingSummary
-        slug={slug}
-        meeting={meeting}
-        onSettingsSaved={() => {
-          void reloadMeeting()
-          setRefreshKey((k) => k + 1)
-        }}
-      />
-
-      {participantNickname ? null : <JoinSection slug={slug} onJoined={onJoined} />}
-
-      {participantNickname ? (
-        <div
-          className={cn(
-            "grid gap-6 lg:items-start",
-            useTwoColumnLayout ? "lg:grid-cols-2" : "lg:grid-cols-1",
-          )}
-        >
-          <AvailabilitySection
-            slug={slug}
-            meeting={meeting}
-            onSubmitted={onParticipantSubmitted}
-          />
-          <TimetableSection
-            slug={slug}
-            meeting={meeting}
-            refreshKey={refreshKey}
-            onConfirmed={onConfirmed}
-          />
-        </div>
-      ) : (
-        <TimetableSection
+    <div className="min-h-screen bg-background text-foreground">
+      <TopBar />
+      <main className="linear-container flex flex-col gap-6 px-5 py-6 sm:py-10 lg:px-10 lg:py-10">
+        <MeetingSummary
           slug={slug}
           meeting={meeting}
-          refreshKey={refreshKey}
-          onConfirmed={onConfirmed}
+          onSettingsSaved={() => {
+            void reloadMeeting()
+            setRefreshKey((k) => k + 1)
+          }}
+          onCancelConfirm={handleCancelConfirm}
         />
-      )}
+
+        <div className="grid gap-6 lg:grid-cols-[1fr_360px] lg:items-start lg:gap-8">
+          <div className="flex min-w-0 flex-col gap-6">
+            {participantNickname ? (
+              <CurrentParticipantCard
+                slug={slug}
+                nickname={participantNickname}
+                isRequired={(meeting.required_nicknames ?? []).includes(participantNickname)}
+                myBufferMinutes={meeting.my_buffer_minutes ?? null}
+                locationType={meeting.location_type}
+                onRenamed={(newName) => {
+                  writeParticipantSession(slug, newName)
+                  setParticipantNickname(newName)
+                  void reloadMeeting()
+                }}
+                onSwitchUser={handleSwitchUser}
+                onBufferChanged={() => {
+                  void reloadMeeting()
+                  setRefreshKey((k) => k + 1)
+                }}
+              />
+            ) : (
+              <JoinSection
+                slug={slug}
+                locationType={meeting.location_type}
+                onJoined={onJoined}
+              />
+            )}
+
+            {participantNickname ? (
+              <AvailabilitySection
+                slug={slug}
+                meeting={meeting}
+                onSubmitted={onParticipantSubmitted}
+              />
+            ) : null}
+
+            <TimetableSection
+              slug={slug}
+              meeting={meeting}
+              refreshKey={refreshKey}
+              onConfirmed={onConfirmed}
+              currentNickname={participantNickname}
+              bestSlots={bestSlots}
+              pickedCandidate={pickedCandidate}
+              onPickedHandled={() => setPickedCandidate(null)}
+            />
+          </div>
+
+          <div className="flex flex-col gap-4 lg:sticky lg:top-20">
+            <RecommendCard
+              slug={slug}
+              meeting={meeting}
+              result={result}
+              calculating={calculating}
+              recommending={recommending}
+              ready={ready}
+              resultError={resultError}
+              onCalculate={handleCalculate}
+              onRecommendResult={handleRecommendResult}
+              setRecommending={setRecommending}
+              onPick={handlePick}
+              onCancelConfirm={handleCancelConfirm}
+            />
+            <Participants meeting={meeting} />
+          </div>
+        </div>
+
+        {slugFootnote ? (
+          <p className="font-mono text-xs text-muted-foreground">{slugFootnote}</p>
+        ) : null}
+      </main>
 
       <ShareMessageDialog
         open={confirmedDialog.open}
@@ -282,6 +336,28 @@ export default function MeetingPage() {
         confirmedRange={confirmedDialog.rangeLabel}
         readOnly
       />
-    </main>
+    </div>
+  )
+}
+
+function TopBar() {
+  return (
+    <div className="sticky top-0 z-10 flex h-14 items-center justify-between border-b border-border bg-background px-5 lg:px-10">
+      <Link to="/" className="flex items-center gap-2.5" data-testid="back-to-home">
+        <div className="flex h-6.5 w-6.5 items-center justify-center rounded-md bg-primary">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <rect x="3" y="3" width="10" height="10" rx="2" stroke="#fff" strokeWidth="1.6" />
+            <path
+              d="M6 7l1.5 1.5L11 5"
+              stroke="#fff"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </div>
+        <div className="text-[15px] font-bold tracking-tight text-foreground">SomaMeet</div>
+      </Link>
+    </div>
   )
 }

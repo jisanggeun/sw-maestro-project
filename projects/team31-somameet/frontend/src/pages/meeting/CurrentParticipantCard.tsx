@@ -1,277 +1,213 @@
-// Inline participant identity widget for the meeting page header.
-// v3.6 — read mode = compact pill (nickname + 수정 + 로그아웃).
-//          edit mode = inline form (nickname + optional PIN, 4-digit).
-// v3.11 — edit mode also exposes a "필수 참여자" checkbox so a mentor /
-//          required attendee can self-mark; recommend.py promotes any
-//          window where every required nickname is present.
+// Current-participant identity card. Phase E redesign:
+//   - Card shell (avatar + nickname + status chips + 재설정 + 로그아웃)
+//   - INLINE buffer chips (0/30/60/90/120) that PATCH the server on click
+//   - Nickname / PIN / 필수 참여자 edits move into SelfEditModal
 //
-// PATCH /api/meetings/{slug}/participants/me 호출.
-//   pin field semantics: omit = 변경 없음 / "" = PIN 제거 / "1234" = 새로 설정.
-//   is_required: omit = 변경 없음 / true|false = 명시적 설정.
+// Replaces the previous "single edit-form for everything" pattern. The inline
+// buffer call goes through PATCH /participants/me (api.updateSelf) with only
+// `buffer_minutes` in the body — same endpoint, narrower payload.
 
-import { useEffect, useState } from "react"
-import { Pencil, X, Check, Loader2, LogOut, Star } from "lucide-react"
+import { useState } from "react"
+import { Loader2, LogOut, Pencil, Star } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { useToast } from "@/components/ui/toast"
 import { api } from "@/lib/api"
-import { ApiError } from "@/lib/types"
+import { ApiError, type LocationType } from "@/lib/types"
+import { cn } from "@/lib/cn"
+import { SelfEditModal } from "./SelfEditModal"
+
+const BUFFER_DEFAULT_MINUTES = 60
+const BUFFER_OPTIONS: Array<{ value: number; label: string }> = [
+  { value: 0, label: "0" },
+  { value: 30, label: "30" },
+  { value: 60, label: "60" },
+  { value: 90, label: "90" },
+  { value: 120, label: "120" },
+]
 
 interface Props {
   slug: string
   nickname: string
   isRequired: boolean
+  myBufferMinutes: number | null
+  locationType: LocationType
   onRenamed: (newNickname: string) => void
   onSwitchUser: () => void
+  onBufferChanged?: (newValue: number | null) => void
 }
-
-const PIN_REGEX = /^\d{4}$/
 
 export function CurrentParticipantCard({
   slug,
   nickname,
   isRequired,
+  myBufferMinutes,
+  locationType,
   onRenamed,
   onSwitchUser,
+  onBufferChanged,
 }: Props) {
   const { toast } = useToast()
-  const [editing, setEditing] = useState(false)
-  const [draftNickname, setDraftNickname] = useState(nickname)
-  const [draftPin, setDraftPin] = useState("")
-  const [pendingClearPin, setPendingClearPin] = useState(false)
-  const [draftIsRequired, setDraftIsRequired] = useState(isRequired)
-  const [submitting, setSubmitting] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [editOpen, setEditOpen] = useState(false)
+  const [bufferBusy, setBufferBusy] = useState<number | null>(null)
 
-  // Keep the draft checkbox in sync with the latest server-known value when
-  // not editing (e.g. another tab toggled it).
-  useEffect(() => {
-    if (!editing) setDraftIsRequired(isRequired)
-  }, [isRequired, editing])
+  const showBuffer = locationType !== "online"
+  const effectiveBuffer = myBufferMinutes ?? BUFFER_DEFAULT_MINUTES
 
-  function startEdit() {
-    setDraftNickname(nickname)
-    setDraftPin("")
-    setPendingClearPin(false)
-    setDraftIsRequired(isRequired)
-    setError(null)
-    setEditing(true)
-  }
+  async function handleBufferPick(next: number) {
+    if (bufferBusy !== null) return
+    // No-op when the picked value already matches the explicit server value.
+    if (next === myBufferMinutes) return
 
-  function cancelEdit() {
-    setEditing(false)
-    setError(null)
-    setDraftNickname(nickname)
-    setDraftPin("")
-    setPendingClearPin(false)
-    setDraftIsRequired(isRequired)
-  }
-
-  async function handleSave(e: React.FormEvent) {
-    e.preventDefault()
-    setError(null)
-
-    const trimmed = draftNickname.trim()
-    if (trimmed.length === 0) {
-      setError("닉네임을 입력하세요.")
-      return
-    }
-    if (trimmed.length > 50) {
-      setError("닉네임은 50자 이내여야 합니다.")
-      return
-    }
-
-    const body: { nickname: string; pin?: string; is_required?: boolean } = {
-      nickname: trimmed,
-    }
-    if (pendingClearPin) {
-      body.pin = ""
-    } else if (draftPin.length > 0) {
-      if (!PIN_REGEX.test(draftPin)) {
-        setError("PIN은 4자리 숫자입니다.")
-        return
-      }
-      body.pin = draftPin
-    }
-    if (draftIsRequired !== isRequired) {
-      body.is_required = draftIsRequired
-    }
-
-    if (
-      body.nickname === nickname &&
-      body.pin === undefined &&
-      body.is_required === undefined
-    ) {
-      setEditing(false)
-      return
-    }
-
-    setSubmitting(true)
+    setBufferBusy(next)
     try {
-      const res = await api.updateSelf(slug, body)
-      const pinMessage = pendingClearPin
-        ? " PIN도 제거되었습니다."
-        : draftPin.length > 0
-          ? " PIN도 설정되었습니다."
-          : ""
-      const requiredMessage =
-        body.is_required !== undefined
-          ? body.is_required
-            ? " 필수 참여자로 표시되었습니다."
-            : " 필수 참여자 표시가 해제되었습니다."
-          : ""
-      toast(
-        `닉네임이 ${res.nickname}(으)로 변경되었습니다.${pinMessage}${requiredMessage}`,
-        "success",
-      )
-      onRenamed(res.nickname)
-      setEditing(false)
-      setDraftPin("")
-      setPendingClearPin(false)
+      const res = await api.updateSelf(slug, {
+        nickname,
+        buffer_minutes: next,
+      })
+      const effective = res.buffer_minutes ?? BUFFER_DEFAULT_MINUTES
+      toast(`버퍼가 ${effective}분으로 변경되었습니다.`, "success")
+      onBufferChanged?.(res.buffer_minutes)
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : "수정에 실패했습니다."
-      setError(msg)
+      const msg = err instanceof ApiError ? err.message : "버퍼 변경에 실패했습니다."
       toast(msg, "error")
     } finally {
-      setSubmitting(false)
+      setBufferBusy(null)
     }
-  }
-
-  if (!editing) {
-    return (
-      <div
-        data-testid="current-participant-card"
-        className="flex flex-wrap items-center gap-2 text-sm"
-      >
-        <span
-          className={
-            isRequired
-              ? "inline-flex items-center gap-1.5 rounded-full border border-primary/40 bg-primary/15 px-3 py-1 font-medium text-primary"
-              : "inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 font-medium text-foreground"
-          }
-          title={isRequired ? "필수 참여자로 표시됨" : undefined}
-        >
-          <span aria-hidden="true">{isRequired ? "★" : "👤"}</span>
-          <span>{nickname}</span>
-        </span>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={startEdit}
-          aria-label="닉네임/PIN 수정"
-          data-testid="rename-toggle"
-        >
-          <Pencil className="h-3.5 w-3.5" />
-          이름/PIN 수정
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={onSwitchUser}
-          aria-label="로그아웃"
-          data-testid="switch-user"
-        >
-          <LogOut className="h-3.5 w-3.5" />
-          로그아웃
-        </Button>
-      </div>
-    )
   }
 
   return (
-    <form
-      onSubmit={handleSave}
+    <div
       data-testid="current-participant-card"
-      className="flex w-full flex-col gap-3 rounded-md border border-border bg-card p-3"
+      className="rounded-2xl border border-border bg-background p-4"
     >
-      <div className="grid gap-3 sm:grid-cols-2">
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor="rename-nickname" className="text-xs">
-            닉네임
-          </Label>
-          <Input
-            id="rename-nickname"
-            value={draftNickname}
-            onChange={(e) => setDraftNickname(e.target.value)}
-            maxLength={50}
-            autoComplete="off"
-            autoFocus
-            className="h-9 text-sm font-medium"
-            data-testid="rename-input"
-          />
-        </div>
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor="rename-pin" className="text-xs">
-            PIN (선택, 4자리 숫자)
-          </Label>
-          <Input
-            id="rename-pin"
-            value={draftPin}
-            onChange={(e) => {
-              setDraftPin(e.target.value.replace(/\D/g, "").slice(0, 4))
-              setPendingClearPin(false)
-            }}
-            placeholder={pendingClearPin ? "(PIN 제거 예정)" : "비우면 변경 안 됨"}
-            inputMode="numeric"
-            maxLength={4}
-            autoComplete="off"
-            className="h-9 text-sm font-medium"
-            data-testid="rename-pin-input"
-            disabled={pendingClearPin}
-          />
-          <button
-            type="button"
-            className="self-start text-xs text-muted-foreground underline-offset-2 hover:text-destructive hover:underline"
-            onClick={() => {
-              setPendingClearPin((v) => !v)
-              if (!pendingClearPin) setDraftPin("")
-            }}
-            data-testid="rename-pin-clear"
-          >
-            {pendingClearPin ? "PIN 제거 취소" : "PIN 제거"}
-          </button>
-        </div>
-      </div>
-      <label className="flex flex-wrap items-center gap-2 text-sm text-foreground">
-        <input
-          type="checkbox"
-          checked={draftIsRequired}
-          onChange={(e) => setDraftIsRequired(e.target.checked)}
-          className="h-4 w-4 rounded border-border accent-primary"
-          data-testid="rename-required-checkbox"
-        />
-        <Star className={draftIsRequired ? "h-3.5 w-3.5 text-primary" : "h-3.5 w-3.5 text-muted-foreground"} />
-        <span>필수 참여자 (이 분이 빠지면 안 되는 회의)</span>
-      </label>
-      <p className="-mt-1 text-xs text-muted-foreground">
-        체크 시: 추천 결과가 본인 가능 시간 안에서만 잡힙니다. 다른 참여자 일부가 빠진
-        후보도 허용됩니다.
-      </p>
-      <div className="flex flex-wrap items-center gap-2">
-        <Button type="submit" size="sm" disabled={submitting} data-testid="rename-save">
-          {submitting ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <Check className="h-3.5 w-3.5" />
-          )}
-          저장
-        </Button>
-        <Button
-          type="button"
-          size="sm"
-          variant="outline"
-          onClick={cancelEdit}
-          disabled={submitting}
-          data-testid="rename-cancel"
+      <div className="flex items-center gap-3">
+        <div
+          aria-hidden="true"
+          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[var(--soma-primary-soft)] text-sm font-bold text-primary"
         >
-          <X className="h-3.5 w-3.5" />
-          취소
-        </Button>
+          {nickname.slice(0, 1)}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-[14.5px] font-bold tracking-tight text-foreground">
+              {nickname}
+            </span>
+            <span className="inline-flex h-[20px] items-center rounded-md border border-success/30 bg-[var(--soma-success-soft)] px-1.5 text-[11px] font-semibold text-success">
+              응답 완료
+            </span>
+            {isRequired ? (
+              <span
+                title="필수 참여자로 표시됨"
+                className="inline-flex h-[20px] items-center gap-1 rounded-md border border-primary/30 bg-[var(--soma-primary-soft)] px-1.5 text-[11px] font-semibold text-primary"
+              >
+                <Star className="h-2.5 w-2.5" />
+                필수 참여자
+              </span>
+            ) : null}
+          </div>
+          <div className="mt-0.5 text-xs text-muted-foreground">본인 참여 정보</div>
+        </div>
+        <div className="flex shrink-0 gap-1.5">
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={() => setEditOpen(true)}
+            aria-label="닉네임/PIN 수정"
+            data-testid="rename-toggle"
+          >
+            <Pencil className="h-3.5 w-3.5" />
+            재설정
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={onSwitchUser}
+            aria-label="로그아웃"
+            data-testid="switch-user"
+          >
+            <LogOut className="h-3.5 w-3.5" />
+            로그아웃
+          </Button>
+        </div>
       </div>
-      {error ? <p className="text-xs text-destructive">{error}</p> : null}
-    </form>
+
+      {showBuffer ? (
+        <>
+          <div className="my-3 h-px bg-border" aria-hidden="true" />
+          <div className="flex items-baseline justify-between gap-2">
+            <div>
+              <div className="text-[13px] font-semibold text-foreground">
+                회의 전후 버퍼
+              </div>
+              <div className="mt-0.5 text-[11.5px] text-muted-foreground">
+                이동·정리 시간을 추천 알고리즘에 반영합니다.
+              </div>
+            </div>
+            <div
+              className="text-[13px] font-bold text-primary"
+              data-testid="buffer-readout"
+            >
+              {effectiveBuffer === 0 ? "없음" : `${effectiveBuffer}분`}
+            </div>
+          </div>
+          <div
+            role="radiogroup"
+            aria-label="회의 전후 버퍼"
+            data-testid="buffer-chips"
+            className="mt-3 grid grid-cols-5 gap-1.5"
+          >
+            {BUFFER_OPTIONS.map((opt) => {
+              const active = effectiveBuffer === opt.value
+              const busy = bufferBusy === opt.value
+              return (
+                <button
+                  key={opt.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  aria-busy={busy}
+                  disabled={bufferBusy !== null}
+                  data-testid={`buffer-chip-${opt.value}`}
+                  onClick={() => handleBufferPick(opt.value)}
+                  className={cn(
+                    "flex h-11 flex-col items-center justify-center rounded-lg text-sm font-bold leading-tight transition-colors disabled:cursor-not-allowed disabled:opacity-60",
+                    active
+                      ? "bg-primary text-primary-foreground shadow-[0_1px_2px_rgba(15,23,42,0.05),_0_8px_18px_rgba(79,90,170,0.22)]"
+                      : "bg-card text-foreground hover:bg-[var(--soma-card-hover)]",
+                  )}
+                >
+                  {busy ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <>
+                      <span className="text-[15px]">{opt.value}</span>
+                      <span
+                        className={cn(
+                          "text-[10px] font-semibold",
+                          active ? "text-primary-foreground/80" : "text-muted-foreground",
+                        )}
+                      >
+                        분
+                      </span>
+                    </>
+                  )}
+                </button>
+              )
+            })}
+          </div>
+        </>
+      ) : null}
+
+      <SelfEditModal
+        open={editOpen}
+        onOpenChange={setEditOpen}
+        slug={slug}
+        nickname={nickname}
+        isRequired={isRequired}
+        onSaved={onRenamed}
+      />
+    </div>
   )
 }

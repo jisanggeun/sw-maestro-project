@@ -92,23 +92,26 @@ def register_participant(
                     },
                 )
             # PIN matches → re-issue cookie (login). Don't mutate PIN.
+            # buffer-on-join: the register form always sends a fresh buffer
+            # choice, so apply it here as well (the user just picked it).
             token = existing.token
             participant_id = existing.id
+            existing.buffer_minutes = payload.buffer_minutes
+            db.add(existing)
+            db.commit()
         else:
-            # Pre-submit re-register: refresh cookie + optionally update PIN /
-            # is_required. Both fields update only when explicitly provided.
+            # Pre-submit re-register: refresh cookie + update PIN /
+            # is_required when explicitly provided. buffer-on-join: also
+            # update buffer_minutes to the freshly-chosen value.
             token = existing.token
             participant_id = existing.id
-            mutated = False
             if payload.pin is not None:
                 existing.pin = payload.pin
-                mutated = True
             if payload.is_required is not None:
                 existing.is_required = bool(payload.is_required)
-                mutated = True
-            if mutated:
-                db.add(existing)
-                db.commit()
+            existing.buffer_minutes = payload.buffer_minutes
+            db.add(existing)
+            db.commit()
     else:
         token = generate_participant_token()
         participant = Participant(
@@ -120,6 +123,7 @@ def register_participant(
             confirmed_at=None,
             created_at=now_kst_naive(),
             is_required=bool(payload.is_required) if payload.is_required is not None else False,
+            buffer_minutes=payload.buffer_minutes,
         )
         db.add(participant)
         db.commit()
@@ -133,6 +137,7 @@ def register_participant(
         "participant_id": participant_id,
         "nickname": nickname,
         "token": token,
+        "buffer_minutes": payload.buffer_minutes,
     }
 
 
@@ -190,6 +195,16 @@ def update_self(
     if "is_required" in data and data["is_required"] is not None:
         me.is_required = bool(data["is_required"])
 
+    # Issue #13 — personal buffer override.
+    #   field absent → leave existing buffer_minutes unchanged.
+    #   explicit null → reset to "inherit the meeting default".
+    #   0/30/60/90/120 → store the explicit value.
+    # Note: allowed even after the meeting is confirmed, mirroring the
+    # nickname/pin/is_required policy. Confirmed slots are already pinned
+    # so the value has no scheduling impact at that point.
+    if "buffer_minutes" in data:
+        me.buffer_minutes = data["buffer_minutes"]
+
     db.add(me)
     db.commit()
     db.refresh(me)
@@ -198,4 +213,5 @@ def update_self(
         "nickname": me.nickname,
         "has_pin": me.pin is not None,
         "is_required": bool(me.is_required),
+        "buffer_minutes": me.buffer_minutes,
     }

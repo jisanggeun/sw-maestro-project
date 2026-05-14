@@ -8,6 +8,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import type { MeetingDetail } from "@/lib/types"
 import {
+  WINDOW_END,
+  WINDOW_START,
   cellsToRanges,
   formatDateLabelTwoLine,
   getMeetingDates,
@@ -22,6 +24,8 @@ interface AvailabilityTimelineProps {
   meeting: MeetingDetail
   value: Set<string>
   onChange: (next: Set<string>) => void
+  // #13 — 본인 적용 버퍼(분). online 회의면 0. range block 양 끝 영역 음영 시각화에 사용.
+  bufferMinutes?: number
 }
 
 const SLOT_MINUTES = 30
@@ -39,10 +43,26 @@ interface DragState {
   currentMin: number
 }
 
-export function AvailabilityTimeline({ meeting, value, onChange }: AvailabilityTimelineProps) {
+// #33 — commit 된 range block 을 잡고 좌우로 평행 이동.
+interface MoveState {
+  range: DayRange
+  anchorClientX: number
+  anchorMin: number
+  deltaMin: number
+  didMove: boolean
+}
+
+const MOVE_THRESHOLD_PX = 5
+
+export function AvailabilityTimeline({
+  meeting,
+  value,
+  onChange,
+  bufferMinutes = 0,
+}: AvailabilityTimelineProps) {
   const dates = getMeetingDates(meeting)
-  const startMin = timeToMinutes(meeting.time_window_start)
-  const endMin = timeToMinutes(meeting.time_window_end)
+  const startMin = timeToMinutes(WINDOW_START)
+  const endMin = timeToMinutes(WINDOW_END)
   const totalMinutes = Math.max(0, endMin - startMin)
 
   const liveValueRef = useRef<Set<string>>(value)
@@ -51,6 +71,13 @@ export function AvailabilityTimeline({ meeting, value, onChange }: AvailabilityT
   const [drag, setDrag] = useState<DragState | null>(null)
   const dragRef = useRef<DragState | null>(null)
   dragRef.current = drag
+
+  // #33 — 막대 평행 이동 state. drag (새 range 그리기) 와 분리.
+  const [move, setMove] = useState<MoveState | null>(null)
+  const moveRef = useRef<MoveState | null>(null)
+  moveRef.current = move
+  // 드래그 직후 발생하는 합성 click 을 한 번 무시해 deleteRange 가 호출 안 되게 함.
+  const suppressClickRef = useRef(false)
 
   const ranges = useMemo(() => cellsToRanges(value), [value])
   const rangesByDate = useMemo(() => {
@@ -202,6 +229,97 @@ export function AvailabilityTimeline({ meeting, value, onChange }: AvailabilityT
     onChange(next)
   }
 
+  // #33 — range block 잡고 좌우로 평행 이동. 같은 bar 안에서만.
+  function clampDelta(r: DayRange, rawDelta: number): number {
+    const minDelta = startMin - r.startMin
+    const maxDelta = endMin - r.endMin
+    return Math.max(minDelta, Math.min(maxDelta, rawDelta))
+  }
+
+  function handleBlockPointerDown(e: React.PointerEvent<HTMLButtonElement>, r: DayRange) {
+    if (e.button !== 0 && e.pointerType === "mouse") return
+    e.stopPropagation()
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId)
+    } catch {
+      // setPointerCapture 미지원 환경 — pointermove 가 block 밖으로 나가면 끊김.
+    }
+    const min = clientXToMinutes(r.date, e.clientX)
+    if (min === null) return
+    suppressClickRef.current = false
+    setMove({
+      range: r,
+      anchorClientX: e.clientX,
+      anchorMin: min,
+      deltaMin: 0,
+      didMove: false,
+    })
+  }
+
+  function handleBlockPointerMove(e: React.PointerEvent<HTMLButtonElement>) {
+    const cur = moveRef.current
+    if (!cur) return
+    const dxPx = e.clientX - cur.anchorClientX
+    if (!cur.didMove && Math.abs(dxPx) <= MOVE_THRESHOLD_PX) return
+    const currentMin = clientXToMinutes(cur.range.date, e.clientX)
+    if (currentMin === null) return
+    const rawDelta = currentMin - cur.anchorMin
+    const snapped = snapMinutes(rawDelta)
+    const clamped = clampDelta(cur.range, snapped)
+    setMove({ ...cur, deltaMin: clamped, didMove: true })
+  }
+
+  function handleBlockPointerUp(e: React.PointerEvent<HTMLButtonElement>) {
+    const cur = moveRef.current
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    } catch {
+      /* ignore */
+    }
+    if (!cur) return
+    if (!cur.didMove) {
+      // 단순 click — onClick 이 자연 발동되어 deleteRange 처리.
+      setMove(null)
+      return
+    }
+    if (cur.deltaMin !== 0) {
+      // Commit: 원래 range cell 제거 + 새 위치 cell 추가. value Set 안 다른 range 와는
+      // cellsToRanges 가 자동 union 처리 → 머지가 자연스럽게 일어남.
+      const oldKeys = rangeToCellKeys(cur.range.date, cur.range.startMin, cur.range.endMin)
+      const newStart = cur.range.startMin + cur.deltaMin
+      const newEnd = cur.range.endMin + cur.deltaMin
+      const newKeys = rangeToCellKeys(cur.range.date, newStart, newEnd)
+      const next = new Set(liveValueRef.current)
+      for (const k of oldKeys) next.delete(k)
+      for (const k of newKeys) next.add(k)
+      onChange(next)
+    }
+    // didMove 가 true 였으면 사용자가 의도적으로 움직였으니, deltaMin 이 0 으로 snap 됐든
+    // 실제 이동했든 합성 click 은 삼킨다 (deleteRange 트리거 방지).
+    suppressClickRef.current = true
+    setMove(null)
+  }
+
+  function handleBlockPointerCancel(e: React.PointerEvent<HTMLButtonElement>) {
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    } catch {
+      /* ignore */
+    }
+    suppressClickRef.current = false
+    setMove(null)
+  }
+
+  function handleBlockClick(e: React.MouseEvent<HTMLButtonElement>, r: DayRange) {
+    e.stopPropagation()
+    if (suppressClickRef.current) {
+      // 드래그 직후 합성 click — 한 번만 무시.
+      suppressClickRef.current = false
+      return
+    }
+    deleteRange(r)
+  }
+
   if (dates.length === 0 || totalMinutes <= 0) {
     return (
       <div className="rounded-md border border-border bg-card p-4 text-sm text-muted-foreground">
@@ -237,7 +355,7 @@ export function AvailabilityTimeline({ meeting, value, onChange }: AvailabilityT
 
             <div className="flex min-w-0 flex-1 flex-col gap-1">
               {/* Hour tick labels above the bar */}
-              <div className="relative h-4 select-none text-[10px] tabular-nums text-muted-foreground/70">
+              <div className="relative h-4 select-none text-xs tabular-nums text-muted-foreground/70 sm:text-[10px]">
                 {hourTicks.map((tickMin) => {
                   const left = minToPercent(tickMin)
                   const hour = Math.floor(tickMin / 60)
@@ -284,38 +402,101 @@ export function AvailabilityTimeline({ meeting, value, onChange }: AvailabilityT
                   if (width <= 0 || barWidth <= 0) return null
                   const startLabel = minutesToTime(r.startMin)
                   const endLabel = minutesToTime(r.endMin)
+                  const isMoving =
+                    move?.didMove === true &&
+                    move.range.date === r.date &&
+                    move.range.startMin === r.startMin &&
+                    move.range.endMin === r.endMin
+                  // #13 — 본인 buffer 시각화. block 양 끝에서 안쪽으로 buffer 만큼 음영.
+                  // buffer % of bar → % of block (자기 자신 폭 기준). 50% cap 으로 두 음영이 겹치지 않게.
+                  const bufferShadePct = (() => {
+                    if (bufferMinutes <= 0 || totalMinutes <= 0) return 0
+                    const bufferPctOfBar = (bufferMinutes / totalMinutes) * 100
+                    const pctOfBlock = (bufferPctOfBar / width) * 100
+                    return Math.min(50, pctOfBlock)
+                  })()
                   return (
                     <button
                       key={`${r.date}-${r.startMin}-${r.endMin}`}
                       type="button"
                       data-testid={`range-${r.date}-${startLabel}-${endLabel}`}
                       className={cn(
-                        "absolute top-1/2 flex -translate-y-1/2 items-center justify-center",
-                        "rounded-md bg-primary text-[11px] font-medium text-primary-foreground shadow-[inset_0_0_0_1px_rgba(255,255,255,0.18)]",
+                        "absolute top-1/2 flex -translate-y-1/2 items-center justify-center touch-none",
+                        "rounded-md bg-primary text-[11px] font-medium text-primary-foreground",
                         "hover:bg-primary/85 focus:outline-none focus:ring-2 focus:ring-ring/50",
+                        isMoving ? "cursor-grabbing opacity-50" : "cursor-grab",
                       )}
                       style={{
                         left: `${left}%`,
                         width: `${width}%`,
                         height: BLOCK_HEIGHT_PX,
                       }}
-                      onPointerDown={(e) => {
-                        // Block drag-start from bubbling to the bar so we don't
-                        // start a new range when the user is trying to delete.
-                        e.stopPropagation()
-                      }}
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        deleteRange(r)
-                      }}
+                      onPointerDown={(e) => handleBlockPointerDown(e, r)}
+                      onPointerMove={handleBlockPointerMove}
+                      onPointerUp={handleBlockPointerUp}
+                      onPointerCancel={handleBlockPointerCancel}
+                      onClick={(e) => handleBlockClick(e, r)}
                       aria-label={`${date} ${startLabel} - ${endLabel} 삭제`}
                     >
+                      {bufferShadePct > 0 ? (
+                        <>
+                          <span
+                            aria-hidden
+                            data-testid={`buffer-shadow-${r.date}-${startLabel}-${endLabel}-start`}
+                            className="pointer-events-none absolute inset-y-0 left-0 rounded-l-md"
+                            style={{
+                              width: `${bufferShadePct}%`,
+                              backgroundImage:
+                                "repeating-linear-gradient(45deg, rgba(255,255,255,0.4) 0 4px, transparent 4px 8px)",
+                            }}
+                          />
+                          <span
+                            aria-hidden
+                            data-testid={`buffer-shadow-${r.date}-${startLabel}-${endLabel}-end`}
+                            className="pointer-events-none absolute inset-y-0 right-0 rounded-r-md"
+                            style={{
+                              width: `${bufferShadePct}%`,
+                              backgroundImage:
+                                "repeating-linear-gradient(45deg, rgba(255,255,255,0.4) 0 4px, transparent 4px 8px)",
+                            }}
+                          />
+                        </>
+                      ) : null}
                       <span className="truncate px-2">
                         {startLabel} - {endLabel}
                       </span>
                     </button>
                   )
                 })}
+
+                {/* #33 — 막대 이동 중 preview block + floating tooltip */}
+                {move?.didMove && move.range.date === date ? (() => {
+                  const newStart = move.range.startMin + move.deltaMin
+                  const newEnd = move.range.endMin + move.deltaMin
+                  const previewLeft = minToPercent(newStart)
+                  const previewWidth = minToPercent(newEnd) - previewLeft
+                  if (previewWidth <= 0) return null
+                  return (
+                    <>
+                      <span
+                        aria-hidden
+                        className="pointer-events-none absolute top-1/2 -translate-y-1/2 rounded-md border border-dashed border-primary bg-primary/40"
+                        style={{
+                          left: `${previewLeft}%`,
+                          width: `${previewWidth}%`,
+                          height: BLOCK_HEIGHT_PX,
+                        }}
+                      />
+                      <span
+                        aria-hidden
+                        className="pointer-events-none absolute -top-7 z-10 -translate-x-1/2 whitespace-nowrap rounded bg-foreground px-2 py-0.5 text-xs text-background"
+                        style={{ left: `${(previewLeft + previewWidth / 2)}%` }}
+                      >
+                        {minutesToTime(newStart)} - {minutesToTime(newEnd)}
+                      </span>
+                    </>
+                  )
+                })() : null}
 
                 {/* Drag preview */}
                 {isDragging ? (
@@ -332,6 +513,23 @@ export function AvailabilityTimeline({ meeting, value, onChange }: AvailabilityT
                     }}
                   />
                 ) : null}
+
+                {/* #30 — drag 중 끝 위치 시각 floating tooltip */}
+                {isDragging ? (() => {
+                  const snappedEnd = Math.min(
+                    endMin,
+                    Math.max(startMin, snapMinutes(previewHi)),
+                  )
+                  return (
+                    <span
+                      aria-hidden
+                      className="pointer-events-none absolute -top-7 z-10 -translate-x-1/2 whitespace-nowrap rounded bg-foreground px-2 py-0.5 text-xs text-background"
+                      style={{ left: `${minToPercent(snappedEnd)}%` }}
+                    >
+                      {minutesToTime(snappedEnd)}
+                    </span>
+                  )
+                })() : null}
               </div>
             </div>
           </div>

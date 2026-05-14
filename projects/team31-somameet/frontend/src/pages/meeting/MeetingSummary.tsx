@@ -1,22 +1,27 @@
-// Meeting summary card. Spec §5.1 — show date_mode, submitted_count, location + buffer,
+// Meeting summary header. Spec §5.1 — show date_mode, submitted_count, location,
 // confirmed slot + message (when present).
 //
-// v3.1 simplify pass (2026-05-06):
-//   - target_count / N/M progress retired. Show "제출자 N명" only.
-//   - "주최자 모드 / 참여자 모드" caption retired.
-//   - is_ready_to_calculate flips on submitted_count >= 1.
+// v4 (2026-05-13) — Soma redesign. Layout follows soma-meeting.jsx MeetingSummary:
+//   row 1: '참여 중' badge + AutoDeleteBadge
+//   row 2: h1 title + SettingsButton (pencil icon)
+//   row 3: 정보 metadata (CalendarIcon date | ClockIcon duration | MapPin location)
+//   row 4: InviteShareRow (QR + URL + 복사)
+//   row 5: 제출 현황 (count + progressbar + Participants chips externally)
+//   row 6: confirmed_slot block (when present, includes 취소 button)
 //
-// v3.2 (Path B): organizer split removed entirely — no isOrganizer prop.
+// Participants chips (submitted_nicknames + required-pending) live in the
+// sibling Participants card now — see ./Participants.tsx.
 
 import { useState } from "react"
-import { Pencil } from "lucide-react"
+import { Calendar as CalendarIcon, Clock, MapPin, Pencil } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { CopyableUrl } from "@/components/CopyableUrl"
+import { Dialog, DialogDescription, DialogFooter, DialogTitle } from "@/components/ui/dialog"
 import type { MeetingDetail } from "@/lib/types"
 import { formatKstRange } from "@/lib/datetime"
-import { cn } from "@/lib/cn"
+import { formatMeetingTitle } from "@/lib/meetingTitle"
 import { EditMeetingDialog } from "./EditMeetingDialog"
+import { InviteShareRow } from "./InviteShareRow"
+import { AutoDeleteBadge } from "./AutoDeleteBadge"
 
 const LOCATION_LABEL: Record<MeetingDetail["location_type"], string> = {
   online: "온라인",
@@ -28,164 +33,102 @@ interface Props {
   slug: string
   meeting: MeetingDetail
   onSettingsSaved: () => void
+  // #24 — 확정 취소 액션. 부모에서 cancelConfirm + reload + refreshKey + dialog close + toast 처리.
+  onCancelConfirm?: () => Promise<void>
 }
 
 function formatDateScope(meeting: MeetingDetail): string {
   if (meeting.date_mode === "range") {
     if (!meeting.date_range_start || !meeting.date_range_end) return "-"
-    return `${meeting.date_range_start} ~ ${meeting.date_range_end} (범위)`
+    return `${formatDateShort(meeting.date_range_start)} – ${formatDateShort(meeting.date_range_end)}`
   }
   const dates = meeting.candidate_dates ?? []
   if (dates.length === 0) return "-"
-  return `${dates.join(", ")} (개별 ${dates.length}일)`
+  if (dates.length <= 2) return dates.map(formatDateShort).join(", ")
+  return `${formatDateShort(dates[0])} 외 ${dates.length - 1}일`
 }
 
-export function MeetingSummary({ slug, meeting, onSettingsSaved }: Props) {
-  const submitted = meeting.submitted_count ?? 0
-  const ready = meeting.is_ready_to_calculate ?? submitted >= 1
+function formatDateShort(iso: string): string {
+  const [, m, d] = iso.split("-")
+  if (!m || !d) return iso
+  return `${Number.parseInt(m, 10)}월 ${Number.parseInt(d, 10)}일`
+}
+
+export function MeetingSummary({
+  slug,
+  meeting,
+  onSettingsSaved,
+  onCancelConfirm,
+}: Props) {
   const [editing, setEditing] = useState(false)
   const isLocked = Boolean(meeting.confirmed_slot)
 
+  // #24 — 확정 취소 다이얼로그 상태.
+  const [cancelDialogOpen, setCancelDialogOpen] = useState(false)
+  const [cancelBusy, setCancelBusy] = useState(false)
+
+  async function handleCancelConfirm() {
+    if (!onCancelConfirm) return
+    setCancelBusy(true)
+    try {
+      await onCancelConfirm()
+      setCancelDialogOpen(false)
+    } catch {
+      // 부모(MeetingPage)에서 토스트로 사용자에게 알리고 throw 함. 여기선 다이얼로그를
+      // 열어두기만 하고 unhandled rejection 만 막는다.
+    } finally {
+      setCancelBusy(false)
+    }
+  }
+
   return (
-    <Card data-testid="meeting-summary" className="surface-edge">
-      <CardHeader className="flex flex-row items-start justify-between gap-3">
-        <div>
-          <CardTitle>{meeting.title}</CardTitle>
-          <CardDescription>모든 시간은 KST 기준입니다.</CardDescription>
+    <section data-testid="meeting-summary" className="flex flex-col gap-3.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="inline-flex h-[22px] items-center gap-1 rounded-md border border-success/30 bg-[var(--soma-success-soft)] px-2 text-[11.5px] font-semibold tracking-tight text-success">
+          {isLocked ? "확정됨" : "참여 중"}
+        </span>
+        <AutoDeleteBadge expiresAt={meeting.expires_at} />
+      </div>
+
+      <div className="flex items-start gap-3">
+        <div className="flex-1 min-w-0">
+          <h1 className="text-2xl font-extrabold leading-tight tracking-[-0.6px] text-foreground lg:text-[28px]">
+            {formatMeetingTitle(meeting.title)}
+          </h1>
+          <div className="mt-1 font-mono text-xs text-muted-foreground">
+            slug: {slug}
+          </div>
         </div>
         {!isLocked ? (
-          <Button
+          <button
             type="button"
-            variant="outline"
-            size="sm"
             onClick={() => setEditing(true)}
             aria-label="회의 설정 수정"
             data-testid="edit-meeting-toggle"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border bg-background text-[color:var(--soma-ink-soft)] transition-colors hover:bg-card"
           >
-            <Pencil className="h-3.5 w-3.5" />
-            설정 수정
-          </Button>
+            <Pencil className="h-4 w-4" />
+          </button>
         ) : null}
-      </CardHeader>
-      <CardContent className="flex flex-col gap-6">
-        <CopyableUrl label="초대 링크" url={meeting.share_url} showQr />
-        <dl className="grid gap-4 text-sm sm:grid-cols-2">
-          <div className="sm:col-span-2">
-            <dt className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              날짜
-            </dt>
-            <dd className="mt-1 text-foreground">{formatDateScope(meeting)}</dd>
-          </div>
-          <div>
-            <dt className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              시간대
-            </dt>
-            <dd className="mt-1 text-foreground">
-              매일 {meeting.time_window_start} ~ {meeting.time_window_end}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              회의 길이
-            </dt>
-            <dd className="mt-1 text-foreground">{meeting.duration_minutes}분</dd>
-          </div>
-          <div>
-            <dt className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              진행 방식
-            </dt>
-            <dd className="mt-1 text-foreground">
-              {LOCATION_LABEL[meeting.location_type]}
-              {meeting.location_type !== "online"
-                ? ` · 버퍼 ${meeting.offline_buffer_minutes}분`
-                : ""}
-            </dd>
-          </div>
-          <div className="sm:col-span-2">
-            <dt className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              제출 현황
-            </dt>
-            <dd className="mt-1 text-foreground" data-testid="progress-text">
-              {submitted}명 제출 완료
-            </dd>
-            <p className="mt-1 text-xs text-muted-foreground">
-              {ready
-                ? "결과를 확인할 준비가 됐습니다."
-                : "최소 1명이 제출하면 결과를 볼 수 있습니다."}
-            </p>
-            <div
-              role="progressbar"
-              aria-valuemin={0}
-              aria-valuenow={submitted}
-              className="mt-2 h-2 overflow-hidden rounded-full bg-secondary"
-            >
-              <div
-                className={cn(
-                  "h-full transition-all",
-                  ready ? "bg-success" : "bg-primary",
-                )}
-                style={{ width: ready ? "100%" : "0%" }}
-                data-testid="progress-bar-fill"
-              />
-            </div>
-            {(meeting.submitted_nicknames ?? []).length > 0 ? (
-              <ul
-                className="mt-3 flex flex-wrap gap-1.5"
-                aria-label="제출 완료한 참여자"
-                data-testid="submitted-nicknames"
-              >
-                {(meeting.submitted_nicknames ?? []).map((nickname) => {
-                  const required = (meeting.required_nicknames ?? []).includes(nickname)
-                  return (
-                  <li
-                    key={nickname}
-                    className={
-                      required
-                        ? "inline-flex items-center gap-1 rounded-full border border-primary/40 bg-primary/15 px-2.5 py-0.5 text-xs font-medium text-primary"
-                        : "inline-flex items-center gap-1 rounded-full border border-success/30 bg-success/10 px-2.5 py-0.5 text-xs font-medium text-success"
-                    }
-                    title={required ? "필수 참여자" : undefined}
-                  >
-                    <span aria-hidden="true">{required ? "★" : "✓"}</span>
-                    <span>{nickname}</span>
-                  </li>
-                  )
-                })}
-              </ul>
-            ) : null}
-            {/* v3.11 — required-but-not-yet-submitted callout */}
-            {(() => {
-              const submitted = new Set(meeting.submitted_nicknames ?? [])
-              const requiredPending = (meeting.required_nicknames ?? []).filter(
-                (n) => !submitted.has(n),
-              )
-              if (requiredPending.length === 0) return null
-              return (
-                <p
-                  className="mt-3 rounded-md border border-primary/30 bg-primary/10 px-2.5 py-1.5 text-xs text-primary"
-                  data-testid="required-pending"
-                >
-                  ★ 필수 참여자 미제출: {requiredPending.join(", ")}
-                </p>
-              )
-            })()}
-          </div>
+      </div>
 
-          {meeting.confirmed_slot ? (
-            <div className="sm:col-span-2 rounded-md border border-primary/30 bg-primary/10 p-3 text-primary">
-              <dt className="text-xs font-semibold uppercase tracking-wide">확정된 시각</dt>
-              <dd className="mt-1 font-medium">
-                {formatKstRange(meeting.confirmed_slot.start, meeting.confirmed_slot.end)}
-              </dd>
-              {meeting.confirmed_share_message ? (
-                <dd className="mt-2 whitespace-pre-wrap rounded bg-background/80 p-2 text-xs text-foreground">
-                  {meeting.confirmed_share_message}
-                </dd>
-              ) : null}
-            </div>
-          ) : null}
-        </dl>
-      </CardContent>
+      <div className="flex flex-wrap items-center gap-3 text-[13.5px] font-medium text-muted-foreground lg:gap-5">
+        <span className="inline-flex items-center gap-1.5">
+          <CalendarIcon className="h-3.5 w-3.5" aria-hidden="true" />
+          {formatDateScope(meeting)}
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <Clock className="h-3.5 w-3.5" aria-hidden="true" />
+          {meeting.duration_minutes}분
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <MapPin className="h-3.5 w-3.5" aria-hidden="true" />
+          {LOCATION_LABEL[meeting.location_type]}
+        </span>
+      </div>
+
+      <InviteShareRow url={meeting.share_url} />
+
       <EditMeetingDialog
         open={editing}
         onOpenChange={setEditing}
@@ -193,6 +136,55 @@ export function MeetingSummary({ slug, meeting, onSettingsSaved }: Props) {
         meeting={meeting}
         onSaved={onSettingsSaved}
       />
-    </Card>
+      {meeting.confirmed_slot ? (
+        <Dialog
+          open={cancelDialogOpen}
+          onOpenChange={(open) => {
+            if (!cancelBusy) setCancelDialogOpen(open)
+          }}
+          labelledBy="cancel-confirm-title"
+        >
+          <div data-testid="cancel-confirm-dialog">
+            <DialogTitle id="cancel-confirm-title">회의 확정 취소</DialogTitle>
+            <DialogDescription>이 회의의 확정을 취소합니다.</DialogDescription>
+            <div className="mt-4 space-y-2 text-sm">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  확정된 시각
+                </div>
+                <div className="mt-1 font-medium text-foreground">
+                  {formatKstRange(meeting.confirmed_slot.start, meeting.confirmed_slot.end)}
+                </div>
+              </div>
+              <p className="text-muted-foreground">
+                취소하면 후보 시간을 다시 선택해야 합니다.
+                {meeting.confirmed_share_message
+                  ? " 저장된 공유 메시지도 함께 삭제됩니다."
+                  : ""}
+              </p>
+            </div>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setCancelDialogOpen(false)}
+                disabled={cancelBusy}
+              >
+                취소
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                onClick={handleCancelConfirm}
+                disabled={cancelBusy}
+                data-testid="cancel-confirm-submit"
+              >
+                {cancelBusy ? "취소 중..." : "확정 취소"}
+              </Button>
+            </DialogFooter>
+          </div>
+        </Dialog>
+      ) : null}
+    </section>
   )
 }
